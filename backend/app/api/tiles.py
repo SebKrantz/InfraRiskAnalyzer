@@ -119,11 +119,15 @@ def _generate_tile_sync(
 ) -> bytes:
     """
     Generate a tile synchronously (runs in thread pool).
-    Returns PNG bytes.
+    Returns PNG bytes. Raises on raster open failure so the endpoint can return 500.
     """
     tile_size = 256
     bounds_wgs84 = _tile_bounds(z, x, y)
-    
+
+    def _open_failed() -> bool:
+        """True if we never had a dataset (initial open failed)."""
+        return cog_url not in getattr(_thread_local, "datasets", {})
+
     try:
         # Use thread-local dataset to avoid thread-safety issues
         src = _get_thread_local_dataset(cog_url)
@@ -131,41 +135,48 @@ def _generate_tile_sync(
         window = from_bounds(*bounds, src.transform)
         data = src.read(1, window=window, out_shape=(tile_size, tile_size))
         data = mask_raster_nodata(data, src.nodata)
-        
+
         colored = apply_colormap(data, palette=palette, vmin=vmin, vmax=vmax)
-        
-        img = Image.fromarray(colored, 'RGB')
+
+        img = Image.fromarray(colored, "RGB")
         img_buffer = io.BytesIO()
-        img.save(img_buffer, format='PNG', optimize=False)
+        img.save(img_buffer, format="PNG", optimize=False)
         return img_buffer.getvalue()
-        
+
+    # RasterioIOError is an OSError, so it is handled before the plain OSError clause
+    # below; in the other order the retry after a dropped connection never ran.
     except rasterio.errors.RasterioIOError as e:
+        # If we failed on initial open (no dataset cached), propagate so user sees error
+        if _open_failed():
+            raise
         # Connection may have been closed - clear thread-local cache and retry once
-        if hasattr(_thread_local, 'datasets') and cog_url in _thread_local.datasets:
-            try:
-                _thread_local.datasets[cog_url].close()
-            except Exception:
-                pass
-            del _thread_local.datasets[cog_url]
-        
-        # Retry with fresh connection
+        try:
+            _thread_local.datasets[cog_url].close()
+        except Exception:
+            pass
+        del _thread_local.datasets[cog_url]
+
         try:
             src = _get_thread_local_dataset(cog_url)
             bounds = _bounds_in_dataset_crs(bounds_wgs84, src)
             window = from_bounds(*bounds, src.transform)
             data = src.read(1, window=window, out_shape=(tile_size, tile_size))
             data = mask_raster_nodata(data, src.nodata)
-            
+
             colored = apply_colormap(data, palette=palette, vmin=vmin, vmax=vmax)
-            
-            img = Image.fromarray(colored, 'RGB')
+
+            img = Image.fromarray(colored, "RGB")
             img_buffer = io.BytesIO()
-            img.save(img_buffer, format='PNG', optimize=False)
+            img.save(img_buffer, format="PNG", optimize=False)
             return img_buffer.getvalue()
         except Exception as retry_e:
             print(f"Tile generation error (retry failed) for z={z},x={x},y={y}: {type(retry_e).__name__}: {retry_e}")
             return _empty_tile()
-        
+
+    except (PermissionError, FileNotFoundError, OSError) as e:
+        # Raster path not readable or missing - propagate so endpoint can return 500
+        raise
+
     except Exception as e:
         print(f"Tile generation error for z={z},x={x},y={y}: {type(e).__name__}: {e}")
         return _empty_tile()
@@ -222,29 +233,27 @@ async def get_tile(
     
     # Run blocking tile generation in thread pool
     loop = asyncio.get_event_loop()
-    tile_bytes = await loop.run_in_executor(
-        _tile_executor,
-        _generate_tile_sync,
-        cog_url,
-        z,
-        x,
-        y,
-        palette,
-        vmin,
-        vmax
-    )
-    
+    try:
+        tile_bytes = await loop.run_in_executor(
+            _tile_executor,
+            _generate_tile_sync,
+            cog_url,
+            z,
+            x,
+            y,
+            palette,
+            vmin,
+            vmax,
+        )
+    except (PermissionError, FileNotFoundError, OSError, rasterio.errors.RasterioIOError) as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cannot read hazard raster: {e!s}",
+        )
+
     # Only cache if we have proper stats (avoid caching tiles with wrong colors)
     if stats:
         with _tile_cache_lock:
             _tile_cache[cache_key] = tile_bytes
-    
+
     return Response(content=tile_bytes, media_type="image/png")
-
-
-@router.post("/tiles/clear-cache")
-async def clear_tile_cache():
-    """Clear tile cache."""
-    with _tile_cache_lock:
-        _tile_cache.clear()
-    return {"message": "Tile cache cleared"}

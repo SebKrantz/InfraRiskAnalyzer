@@ -22,7 +22,7 @@ from app.config import settings
 from app.api.upload import uploaded_files
 from app.api.hazards import load_hazards_dict
 from app.api.analyze import get_cached_raster_values, get_cached_analysis_result
-from app.utils.geospatial import analyze_intersection, mask_raster_nodata, vulnerability_interp_from_arrays
+from app.utils.geospatial import analyze_intersection, mask_raster_nodata
 from app.utils.export_data import (
     lines_aggregate_to_csv_bytes,
     lines_split_to_gpkg_bytes,
@@ -109,9 +109,9 @@ def _run_data_export(
     if mode in ("csv_lines_aggregate", "gpkg_lines_split") and geometry_type != "LineString":
         raise ValueError("MODE_GEOMETRY_MISMATCH")
 
+    # The result at this exact threshold: falling back to the one without a
+    # threshold exported other numbers than the screen showed
     cached_analysis = get_cached_analysis_result(file_id, hazard_id, intensity_threshold)
-    if cached_analysis is None:
-        cached_analysis = get_cached_analysis_result(file_id, hazard_id, None)
     if cached_analysis is None:
         raise ValueError("NO_ANALYSIS_CACHE")
 
@@ -136,16 +136,11 @@ def _run_data_export(
         line_data = cached_analysis.get("line_data")
         if line_data is None:
             line_data = []
-        vi = cached_analysis.get("vulnerability_curve_intensity")
-        vp = cached_analysis.get("vulnerability_curve_proportion")
         repl = cached_analysis.get("vulnerability_replacement_value")
-        interp = None
-        if vi is not None and vp is not None and len(vi) > 0 and len(vp) > 0:
-            interp = vulnerability_interp_from_arrays(
-                np.asarray(vi, dtype=np.float64),
-                np.asarray(vp, dtype=np.float64),
-            )
-        body = lines_split_to_gpkg_bytes(line_data, interp, repl)
+        interp, lower, upper = cached_analysis.get("vulnerability_interps", (None, None, None))
+        body = lines_split_to_gpkg_bytes(
+            line_data, intensity_threshold, interp, repl, lower, upper
+        )
         return body, f"lines_split_{short_f}_{short_h}.gpkg", "application/geopackage+sqlite3"
 
     raise ValueError("INVALID_MODE")
@@ -775,22 +770,15 @@ async def export_barchart(request: ExportBarchartRequest):
         raise HTTPException(status_code=500, detail="Hazard layer missing dataset_url")
     
     try:
-        # Since button only appears after analysis completes, we should always have a cached result
-        # Try to find cached result (check with provided threshold first, then try None)
+        # The export buttons appear once the analysis is done, so the result at this
+        # exact threshold is cached; falling back to the one without a threshold
+        # exported other numbers than the screen showed
         cached_analysis = get_cached_analysis_result(
-            request.file_id, 
-            request.hazard_id, 
+            request.file_id,
+            request.hazard_id,
             request.intensity_threshold
         )
-        
-        # If not found with threshold, try without threshold (for cases where threshold wasn't used)
-        if cached_analysis is None:
-            cached_analysis = get_cached_analysis_result(
-                request.file_id, 
-                request.hazard_id, 
-                None
-            )
-        
+
         if cached_analysis is None:
             raise HTTPException(
                 status_code=404,
@@ -846,7 +834,10 @@ async def export_barchart(request: ExportBarchartRequest):
             media_type="image/png",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-        
+
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -879,22 +870,15 @@ async def export_map(request: ExportMapRequest):
         raise HTTPException(status_code=500, detail="Hazard layer missing dataset_url")
     
     try:
-        # Since button only appears after analysis completes, we should always have a cached result
-        # Try to find cached result (check with provided threshold first, then try None)
+        # The export buttons appear once the analysis is done, so the result at this
+        # exact threshold is cached; falling back to the one without a threshold
+        # exported other numbers than the screen showed
         cached_analysis = get_cached_analysis_result(
-            request.file_id, 
-            request.hazard_id, 
+            request.file_id,
+            request.hazard_id,
             request.intensity_threshold
         )
-        
-        # If not found with threshold, try without threshold (for cases where threshold wasn't used)
-        if cached_analysis is None:
-            cached_analysis = get_cached_analysis_result(
-                request.file_id, 
-                request.hazard_id, 
-                None
-            )
-        
+
         if cached_analysis is None:
             raise HTTPException(
                 status_code=404,
@@ -950,7 +934,10 @@ async def export_map(request: ExportMapRequest):
             media_type="image/png",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-        
+
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,

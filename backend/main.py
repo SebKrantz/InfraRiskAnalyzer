@@ -1,5 +1,5 @@
 """
-FastAPI backend for Hazard-Infrastructure Analyzer
+FastAPI backend for Infrastructure Risk Analyzer
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -12,7 +12,7 @@ from app.api import upload, hazards, analyze, tiles, export
 from app.config import settings
 
 app = FastAPI(
-    title="Hazard-Infrastructure Analyzer API",
+    title="Infrastructure Risk Analyzer API",
     description="API for analyzing infrastructure assets against hazard layers",
     version="1.0.0"
 )
@@ -40,7 +40,7 @@ app.include_router(export.router, prefix="/api", tags=["export"])
 @app.get("/")
 async def root():
     """Root endpoint"""
-    return {"message": "Hazard-Infrastructure Analyzer API", "version": "1.0.0"}
+    return {"message": "Infrastructure Risk Analyzer API", "version": "1.0.0"}
 
 
 @app.get("/health")

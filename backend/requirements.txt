@@ -8,8 +8,6 @@ python-dotenv         # backend/.env with CARTO_API_KEY
 geopandas>=0.14.0
 pyogrio>=0.5.0
 rasterio>=1.3.9
-xarray>=2023.10.0
-rioxarray>=0.16.0
 
 # Data processing
 pandas>=2.1.0

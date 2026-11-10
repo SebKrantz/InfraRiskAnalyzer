@@ -26,16 +26,12 @@ class Settings:
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
     
-    # Paths
+    # Paths. Uploads are never written to disk (they are parsed in the system temp
+    # folder and held in memory), so there is no upload directory.
     BASE_DIR: Path = Path(__file__).parent.parent.parent
-    UPLOAD_DIR: Path = BASE_DIR / "uploads"
     DATA_DIR: Path = BASE_DIR / "data"
     HAZARD_LAYERS_CSV: Path = DATA_DIR / "hazard_layers.csv"
-    
-    # Ensure directories exist
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # CARTO basemap API key — CARTO's raster basemaps (Positron / Dark Matter)
     # now require ?key=<...>. Used server-side for PNG export basemaps and, where
     # the backend serves the built SPA, substituted into index.html for the
@@ -43,7 +39,11 @@ class Settings:
     CARTO_API_KEY: str = os.getenv("CARTO_API_KEY", "")
 
     # File upload settings
-    MAX_UPLOAD_SIZE: int = 100 * 1024 * 1024  # 100 MB
+    MAX_UPLOAD_SIZE: int = int(float(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024)
+    # A zipped shapefile may unpack to at most this many times the upload limit
+    MAX_UNZIPPED_FACTOR: int = 10
+    # Uploads held in memory at once; past this, the least recently used is dropped
+    MAX_UPLOADS: int = int(os.getenv("MAX_UPLOADS", "100"))
     ALLOWED_EXTENSIONS: set = {".shp", ".gpkg", ".zip", ".csv", ".geojson"}
     # An upload unused for this long is deleted from memory, with its cached results.
     # The browser deletes its own upload when the user replaces it or leaves the page;

@@ -13,9 +13,84 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import settings
-from app.utils.geospatial import load_spatial_file, load_csv_points, validate_geometry_type, convert_polygons_to_centroids
+from app.utils.geospatial import (
+    load_spatial_file, load_csv_points, validate_geometry_type, convert_polygons_to_centroids,
+    drop_missing_geometries, explode_multipoints, json_safe_attributes,
+)
 
 router = APIRouter()
+
+_READ_CHUNK = 1024 * 1024
+
+
+class UploadRejected(ValueError):
+    """The file cannot be used as uploaded; the message says why (HTTP 400)."""
+
+
+async def _read_limited(file: UploadFile) -> bytes:
+    """Read the upload, refusing it (413) as soon as it passes MAX_UPLOAD_SIZE rather
+    than after holding all of it in memory."""
+    chunks, size = [], 0
+    while True:
+        chunk = await file.read(_READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > settings.MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {settings.MAX_UPLOAD_SIZE / (1024 * 1024):g} MB",
+            )
+        chunks.append(chunk)
+
+
+def _shapefile_from_zip(content: bytes, temp_dir: str) -> str:
+    """Unpack a zipped shapefile into temp_dir and return the path of its .shp.
+
+    The archive is written under a fixed name (the client's file name could hold a
+    path), its unpacked size is capped, and the .shp may sit in a folder inside the
+    zip, as when a folder is compressed.
+    """
+    zip_path = Path(temp_dir) / "upload.zip"
+    zip_path.write_bytes(content)
+    out_dir = Path(temp_dir) / "unzipped"
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            unpacked = sum(info.file_size for info in zf.infolist())
+            limit = settings.MAX_UPLOAD_SIZE * settings.MAX_UNZIPPED_FACTOR
+            if unpacked > limit:
+                raise UploadRejected(
+                    f"The zip unpacks to {unpacked / 1024 ** 2:,.0f} MB, more than the "
+                    f"{limit / 1024 ** 2:,.0f} MB allowed."
+                )
+            # extractall strips absolute paths and ".." from member names
+            zf.extractall(out_dir)
+    except zipfile.BadZipFile:
+        raise UploadRejected("The file is not a valid zip archive.")
+    shp_files = sorted(
+        p for p in out_dir.rglob("*.shp")
+        if "__MACOSX" not in p.parts and not p.name.startswith(".")
+    )
+    if not shp_files:
+        raise UploadRejected("No .shp file found in the zip archive.")
+    if len(shp_files) > 1:
+        names = ", ".join(p.name for p in shp_files[:5])
+        raise UploadRejected(
+            f"The zip holds {len(shp_files)} shapefiles ({names}); upload one at a time."
+        )
+    return str(shp_files[0])
+
+
+def _drop_least_recently_used() -> None:
+    """Keep at most MAX_UPLOADS uploads in memory by dropping the least recently used."""
+    excess = len(uploaded_files) - settings.MAX_UPLOADS + 1
+    if excess <= 0:
+        return
+    by_age = sorted(
+        dict.items(uploaded_files), key=lambda kv: kv[1].get("last_used", 0.0)
+    )
+    for file_id, _ in by_age[:excess]:
+        forget_upload(file_id)
 
 class _UploadStore(dict):
     """Uploaded datasets by file_id, in memory only. Reading an entry marks it as used,
@@ -78,15 +153,12 @@ def _start_sweeper() -> None:
 
 
 @router.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    file_id: Optional[str] = None
-):
+async def upload_file(file: UploadFile = File(...)):
     """
     Upload a spatial file (Shapefile, GeoPackage, GeoJSON, or CSV with coordinates)
 
     Accepts:
-    - .shp (zipped shapefile)
+    - .zip (zipped shapefile: .shp with its .shx, .dbf and .prj, possibly in a folder)
     - .gpkg (GeoPackage)
     - .geojson (GeoJSON)
     - .csv (with lat/lon, lat/lng, latitude/longitude, or y/x columns, or a
@@ -95,81 +167,52 @@ async def upload_file(
 
     Shapefile and GeoPackage may contain Polygon or MultiPolygon geometries
     (e.g. buildings); these are converted to centroid points for analysis.
+    MultiPoint features are split into points, and features without a geometry
+    are skipped.
 
     Returns file metadata including geometry type and feature count
     """
-    # Validate file extension
-    file_ext = Path(file.filename).suffix.lower()
+    filename = Path(file.filename or "").name
+    file_ext = Path(filename).suffix.lower()
     if file_ext not in settings.ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"File type not supported. Allowed: {', '.join(settings.ALLOWED_EXTENSIONS)}"
+            detail=f"File type not supported. Allowed: {', '.join(sorted(settings.ALLOWED_EXTENSIONS))}"
         )
-    
-    # Check file size
-    file_content = await file.read()
-    if len(file_content) > settings.MAX_UPLOAD_SIZE:
+    if file_ext == ".shp":
         raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size: {settings.MAX_UPLOAD_SIZE / (1024*1024)} MB"
+            status_code=400,
+            detail="Upload a shapefile as a .zip holding the .shp together with its "
+            ".shx, .dbf and .prj files.",
         )
-    
+
+    file_content = await _read_limited(file)
+
     expire_uploads()
     _start_sweeper()
 
-    # Generate file ID if not provided
-    if not file_id:
-        import uuid
-        file_id = str(uuid.uuid4())
-    
+    import uuid
+    file_id = str(uuid.uuid4())
+
     try:
-        # Save uploaded file
-        if file_ext == ".zip":
-            # Handle zipped shapefile
-            with tempfile.TemporaryDirectory() as temp_dir:
-                zip_path = Path(temp_dir) / file.filename
-                zip_path.write_bytes(file_content)
-                
-                # Extract zip file
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-                
-                # Find .shp file
-                shp_files = list(Path(temp_dir).glob("*.shp"))
-                if not shp_files:
-                    raise HTTPException(status_code=400, detail="No .shp file found in zip archive")
-                
-                # Load and validate
-                gdf = load_spatial_file(str(shp_files[0]))
-                
-        elif file_ext == ".csv":
-            # Handle CSV file with point coordinates
-            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.csv') as tmp_file:
-                tmp_file.write(file_content)
-                tmp_path = tmp_file.name
-            
-            try:
-                gdf = load_csv_points(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-                
-        else:
-            # Handle GPKG or other spatial files
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-                tmp_file.write(file_content)
-                tmp_path = tmp_file.name
-            
-            try:
-                gdf = load_spatial_file(tmp_path)
-            finally:
-                os.unlink(tmp_path)
+        gdf = _load_upload(file_content, file_ext)
+        gdf, skipped = drop_missing_geometries(gdf)
+        if len(gdf) == 0:
+            raise UploadRejected("The file has no features with a geometry.")
 
         # Convert Polygon/MultiPolygon to centroids (point dataset) before validation
         gdf = convert_polygons_to_centroids(gdf)
+        gdf = explode_multipoints(gdf)
 
         # Validate geometry type (points or lines)
         geometry_type = validate_geometry_type(gdf)
-        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Whatever stops a file from being read or used is a problem with the file
+        raise HTTPException(status_code=400, detail=_scrub_temp_paths(str(e), filename))
+
+    try:
         # Clean NaN values from GeoDataFrame before storing (clean once, not during analysis)
         import numpy as np
         import pandas as pd
@@ -179,14 +222,17 @@ async def upload_file(
                     gdf[col] = gdf[col].replace([np.nan, np.inf, -np.inf], [None, None, None])
                 elif pd.api.types.is_numeric_dtype(gdf[col]):
                     gdf[col] = gdf[col].replace([np.nan], [None])
-        
+        gdf = json_safe_attributes(gdf)
+
         # Transform to WGS84 in place (all hazard rasters use EPSG:4326, so store in WGS84)
         if gdf.crs and gdf.crs != "EPSG:4326":
             gdf = gdf.to_crs("EPSG:4326")
-        
+
+        _drop_least_recently_used()
+
         # Store metadata and GeoDataFrame
         uploaded_files[file_id] = {
-            "filename": file.filename,
+            "filename": filename,
             "geometry_type": geometry_type,
             "feature_count": len(gdf),
             "crs": str(gdf.crs) if gdf.crs else None,
@@ -199,7 +245,7 @@ async def upload_file(
             "gdf": gdf,  # Store GeoDataFrame for analysis (already cleaned and in WGS84)
             "last_used": time.monotonic(),
         }
-        
+
         # Convert to GeoJSON for display (gdf is already in WGS84 and cleaned)
         # Strip per-feature bbox to avoid MapLibre geojson-vt tiler issues
         try:
@@ -211,23 +257,56 @@ async def upload_file(
         except Exception as e:
             print(f"Warning: Could not convert to GeoJSON for upload response: {e}")
             geo_json = None
-        
+
+        message = "File uploaded successfully"
+        if skipped:
+            message += f"; {skipped} feature{'s' if skipped != 1 else ''} without a geometry skipped"
         return JSONResponse(content={
             "file_id": file_id,
-            "filename": file.filename,
+            "filename": filename,
             "geometry_type": geometry_type,
             "feature_count": len(gdf),
+            "skipped_features": skipped,
             "crs": uploaded_files[file_id]["crs"],
             "bounds": uploaded_files[file_id]["bounds"],
             "geojson": geo_json,  # Include GeoJSON for initial display
-            "message": "File uploaded successfully"
+            "message": message,
         })
-        
+
     except Exception as e:
+        uploaded_files.pop(file_id, None)
+        print(f"Upload processing failed: {type(e).__name__}: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing file: {str(e)}"
+            detail=f"Error processing file: {_scrub_temp_paths(str(e), filename)}"
         )
+
+
+def _load_upload(content: bytes, file_ext: str):
+    """Parse the uploaded bytes in a temporary location that is removed afterwards."""
+    if file_ext == ".zip":
+        with tempfile.TemporaryDirectory() as temp_dir:
+            return load_spatial_file(_shapefile_from_zip(content, temp_dir))
+
+    suffix = ".csv" if file_ext == ".csv" else file_ext
+    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=suffix) as tmp_file:
+        tmp_file.write(content)
+        tmp_path = tmp_file.name
+    try:
+        return load_csv_points(tmp_path) if file_ext == ".csv" else load_spatial_file(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+
+def _scrub_temp_paths(message: str, filename: str) -> str:
+    """Put the uploaded file's name in place of the temporary paths a reader's error
+    message carries, which say nothing to the user and describe the server."""
+    import re
+
+    name = filename or "the file"
+    for root in {tempfile.gettempdir(), os.path.realpath(tempfile.gettempdir())}:
+        message = re.sub(re.escape(root) + r"[^\s'\",;)]*", lambda _m: name, message)
+    return message
 
 
 @router.get("/upload/{file_id}")

@@ -129,12 +129,21 @@ def lines_aggregate_to_csv_bytes(segment_gdf: gpd.GeoDataFrame) -> bytes:
 
 def lines_split_to_gpkg_bytes(
     line_data: list[dict[str, Any]],
+    intensity_threshold: Optional[float],
     vulnerability_interp: Optional[Callable[[float], float]],
     replacement_value: Optional[float],
+    vulnerability_lower_interp: Optional[Callable[[float], float]] = None,
+    vulnerability_upper_interp: Optional[Callable[[float], float]] = None,
 ) -> bytes:
     """
-    GPKG: consecutive sample pairs per line part; columns id, hazard_intensity,
-    and optionally damage_ratio, damage_cost (no original line attributes).
+    GPKG: consecutive sample pairs per line part; columns id, affected,
+    hazard_intensity, and optionally damage_ratio, damage_cost and the
+    damage_cost_lower / damage_cost_upper bounds (no original line attributes).
+
+    A span is affected as in the analysis: when its second sample point is at or
+    above the threshold (above 0 without one). Damage is charged on affected spans
+    only, so the spans' damage_cost adds up to the total the app reports; the
+    split used to charge every span and ignore the threshold.
 
     Where neither endpoint of a span was measured, hazard_intensity is NaN but
     damage_ratio is 0.0. The asymmetry is deliberate: an intensity is a
@@ -144,12 +153,24 @@ def lines_split_to_gpkg_bytes(
     """
     geod = Geod(ellps="WGS84")
     vuln_on = vulnerability_interp is not None and replacement_value is not None
+    has_bounds = (
+        vuln_on
+        and vulnerability_lower_interp is not None
+        and vulnerability_upper_interp is not None
+    )
 
     ids: list = []
     coords: list = []
+    affected: list = []
     hazard: list = []
     ratio: list = []
     cost: list = []
+    cost_lower: list = []
+    cost_upper: list = []
+
+    def span_ratio(interp, rv, valid):
+        vuln_pt = np.asarray(interp(rv), dtype=np.float64)
+        return np.nan_to_num(pairwise_mean(np.where(valid, vuln_pt, 0.0), valid), nan=0.0)
 
     for ld in line_data:
         pts = ld["sampled_points"]
@@ -161,7 +182,14 @@ def lines_split_to_gpkg_bytes(
         lats = np.fromiter((p[1] for p in pts), dtype=np.float64, count=n)
 
         valid = ~np.isnan(rv)
+        if intensity_threshold is not None:
+            point_affected = valid & (rv >= intensity_threshold)
+        else:
+            point_affected = valid & (rv > 0)
+        span_affected = point_affected[1:]
+
         hazard.append(pairwise_mean(rv, valid))
+        affected.append(span_affected)
         ids.append(np.full(n - 1, int(ld["line_id"]), dtype=np.int64))
 
         # Each span is a two-point line: interleave its start and end coordinates
@@ -173,16 +201,22 @@ def lines_split_to_gpkg_bytes(
         coords.append(pair)
 
         if vuln_on:
-            vuln_pt = np.asarray(vulnerability_interp(rv), dtype=np.float64)
-            dr = np.nan_to_num(
-                pairwise_mean(np.where(valid, vuln_pt, 0.0), valid), nan=0.0
-            )
             # One geodesic call per line rather than one per 100 m span
             _, _, seg_len = geod.inv(
                 lons[:-1], lats[:-1], lons[1:], lats[1:], return_back_azimuth=True
             )
+            dr = np.where(span_affected, span_ratio(vulnerability_interp, rv, valid), 0.0)
             ratio.append(dr)
             cost.append(float(replacement_value) * dr * seg_len)
+            if has_bounds:
+                for interp, out in (
+                    (vulnerability_lower_interp, cost_lower),
+                    (vulnerability_upper_interp, cost_upper),
+                ):
+                    out.append(
+                        float(replacement_value) * seg_len
+                        * np.where(span_affected, span_ratio(interp, rv, valid), 0.0)
+                    )
 
     if ids:
         all_coords = np.concatenate(coords)
@@ -191,21 +225,29 @@ def lines_split_to_gpkg_bytes(
         )
         data: dict[str, Any] = {
             "id": np.concatenate(ids),
+            "affected": np.concatenate(affected),
             "hazard_intensity": np.concatenate(hazard),
         }
         if vuln_on:
             data["damage_ratio"] = np.concatenate(ratio)
             data["damage_cost"] = np.concatenate(cost)
+            if has_bounds:
+                data["damage_cost_lower"] = np.concatenate(cost_lower)
+                data["damage_cost_upper"] = np.concatenate(cost_upper)
         gdf = gpd.GeoDataFrame(data, geometry=geoms, crs="EPSG:4326")
     else:
         empty_cols: dict[str, Any] = {
             "id": pd.Series(dtype="int64"),
+            "affected": pd.Series(dtype="bool"),
             "hazard_intensity": pd.Series(dtype="float64"),
             "geometry": gpd.GeoSeries([], crs="EPSG:4326"),
         }
         if vuln_on:
             empty_cols["damage_ratio"] = pd.Series(dtype="float64")
             empty_cols["damage_cost"] = pd.Series(dtype="float64")
+            if has_bounds:
+                empty_cols["damage_cost_lower"] = pd.Series(dtype="float64")
+                empty_cols["damage_cost_upper"] = pd.Series(dtype="float64")
         gdf = gpd.GeoDataFrame(empty_cols, crs="EPSG:4326")
 
     buf = io.BytesIO()
