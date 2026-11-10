@@ -2,7 +2,7 @@
 .DS_Store
 /App Structure.md
 /cursor_build_steps.md
-/venv
+venv/
 /workflow.md
 
 # Hazard rasters (too large for git) and generated catalog backup

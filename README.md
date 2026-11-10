@@ -35,7 +35,7 @@ A high-performance web application for analyzing infrastructure assets against h
 
 ### Prerequisites
 
-- **Backend**: Python 3.9 or higher
+- **Backend**: Python 3.10 or higher
 - **Frontend**: Node.js 18+ and npm
 
 ### Backend Setup
@@ -257,6 +257,11 @@ Notes:
 - Ensure `data/hazard_layers.csv` is present on the server or included in the bundle.
 - Keep `--workers 1` in production unless you add a shared cache (e.g., Redis).
 - See the Posit Connect FastAPI docs for entrypoint details.
+
+## Documentation
+
+- [Technical guide](docs/infra-risk-analyzer-technical-guide.pdf): installation, configuration and deployment, for IT teams (Word source alongside)
+- [User guide](frontend/public/infra-risk-analyzer-guide.pdf): how to use the tool, opened by the Guide button in the app
 
 ## License
 
