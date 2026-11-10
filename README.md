@@ -194,7 +194,7 @@ For detailed API documentation, visit `http://localhost:8000/docs` when the back
 - `HOST`: Server host (default: `0.0.0.0`)
 - `PORT`: Server port (default: `8000`)
 - `DEBUG`: Debug mode (default: `False`)
-- `CARTO_API_KEY`: CARTO basemap key (Positron / Dark Matter), read from `backend/.env`; without it the tiles are requested unkeyed
+- `CARTO_API_KEY`: CARTO basemap key (Positron / Dark Matter), read from `backend/.env` (copy `backend/.env.example`); without it the tiles are requested unkeyed
 
 The frontend dev proxy targets `http://localhost:8000`; override with `BACKEND_URL` if that port is
 taken (`BACKEND_URL=http://127.0.0.1:8123 npm run dev`).
