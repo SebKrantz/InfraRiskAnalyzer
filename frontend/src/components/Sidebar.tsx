@@ -187,7 +187,7 @@ export default function Sidebar({
     Number.isFinite(value) ? String(Math.round(value * 10) / 10) : ''
 
   // Resync when the threshold changes from somewhere else: dragging the
-  // slider, or the reset to the layer minimum when a hazard is selected.
+  // slider, or the threshold set for a newly selected hazard layer.
   useEffect(() => {
     if (thresholdEditing.current) return
     setThresholdInput(formatThreshold(intensityThreshold))

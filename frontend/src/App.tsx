@@ -14,6 +14,11 @@ function App() {
   const [intensityThreshold, setIntensityThreshold] = useState<number>(0)
   const [hazardOpacity, setHazardOpacity] = useState<number>(60)
   const [hazardStats, setHazardStats] = useState<{ min: number; max: number } | null>(null)
+  // The layer hazardStats (and so the threshold) belongs to. The analysis waits for it, so a
+  // layer change runs one analysis, at the threshold chosen for the new layer.
+  const [statsHazardId, setStatsHazardId] = useState<string | null>(null)
+  // Unit and minimum of the layer the current threshold was set on
+  const thresholdLayer = useRef<{ unit: string; min: number } | null>(null)
   const [basemap, setBasemap] = useState<Basemap>('positron')
   const [hazards, setHazards] = useState<Hazard[]>([])
   const [loadingUpload, setLoadingUpload] = useState(false)
@@ -38,24 +43,45 @@ function App() {
 
   // Fetch hazard statistics when hazard is selected
   useEffect(() => {
+    // A slower answer for a layer selected earlier must not overwrite this one's
+    let cancelled = false
     const fetchStats = async () => {
       if (!selectedHazard) {
         setHazardStats(null)
+        setStatsHazardId(null)
         setIntensityThreshold(0)
+        thresholdLayer.current = null
         return
       }
 
       try {
         const stats = await getHazardStats(selectedHazard.id)
+        if (cancelled) return
         setHazardStats({ min: stats.min, max: stats.max })
-        setIntensityThreshold(stats.min)
+        // A threshold set on the previous layer carries over to a layer in the same unit
+        // (another return period or scenario) when it lies within the new layer's range.
+        // Otherwise the threshold starts at the layer minimum.
+        const unit = selectedHazard.unit ?? ''
+        const prev = thresholdLayer.current
+        setIntensityThreshold((t) =>
+          prev && prev.unit === unit && t > prev.min && t >= stats.min && t <= stats.max
+            ? t
+            : stats.min
+        )
+        thresholdLayer.current = { unit, min: stats.min }
       } catch (err) {
+        if (cancelled) return
         console.error('Failed to fetch hazard statistics:', err)
         setError(err instanceof Error ? err.message : 'Failed to load hazard layer')
         setHazardStats({ min: 0, max: 100 })
+        thresholdLayer.current = null
       }
+      setStatsHazardId(selectedHazard.id)
     }
     fetchStats()
+    return () => {
+      cancelled = true
+    }
   }, [selectedHazard])
 
   // Handle file upload
@@ -111,6 +137,9 @@ function App() {
       return
     }
 
+    // The threshold for a newly selected layer is set once its statistics arrive
+    if (statsHazardId !== selectedHazard.id) return
+
     // If vulnerability analysis is enabled, require both curve file and a positive replacement value
     const vulnerabilityInputsIncomplete =
       vulnerabilityAnalysisEnabled &&
@@ -152,7 +181,7 @@ function App() {
     // Debounce analysis calls
     const timeoutId = setTimeout(performAnalysis, 300)
     return () => clearTimeout(timeoutId)
-  }, [uploadedFile, selectedHazard, intensityThreshold, vulnerabilityAnalysisEnabled, vulnerabilityCurveFile, replacementValue])
+  }, [uploadedFile, selectedHazard, statsHazardId, intensityThreshold, vulnerabilityAnalysisEnabled, vulnerabilityCurveFile, replacementValue])
 
   return (
     <div className="flex h-screen w-screen overflow-hidden m-0 p-0">
