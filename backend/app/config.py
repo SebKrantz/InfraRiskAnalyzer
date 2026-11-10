@@ -6,6 +6,18 @@ import os
 from pathlib import Path
 from typing import Optional
 
+
+# backend/.env (gitignored) holds the API keys, such as CARTO_API_KEY below, for a
+# local run; on Posit Connect they are set as the content's Vars. Load it before
+# anything reads the environment — Settings' attributes are evaluated once, when
+# the class is defined. Variables already set in the environment win over the file.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except ImportError:  # python-dotenv missing; the environment alone applies
+    pass
+
 class Settings:
     """Application settings"""
     

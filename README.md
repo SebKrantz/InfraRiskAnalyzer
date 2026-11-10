@@ -249,10 +249,11 @@ npm run build:connect
 
 2. Deploy the FastAPI app from the repo root:
 ```bash
-rsconnect deploy fastapi -n <saved-server-name> --entrypoint main:app backend/
+rsconnect deploy fastapi -n <saved-server-name> --entrypoint main:app --exclude .env backend/
 ```
 
 Notes:
+- Set `CARTO_API_KEY` under the content's Vars on Connect. For a local run, copy `backend/.env.example` to `backend/.env`; `--exclude .env` keeps that file out of the bundle.
 - Ensure `data/hazard_layers.csv` is present on the server or included in the bundle.
 - Keep `--workers 1` in production unless you add a shared cache (e.g., Redis).
 - See the Posit Connect FastAPI docs for entrypoint details.

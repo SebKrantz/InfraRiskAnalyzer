@@ -2,6 +2,7 @@
 fastapi>=0.104.1
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
+python-dotenv         # backend/.env with CARTO_API_KEY (local runs)
 
 # Geospatial libraries
 geopandas>=0.14.0
