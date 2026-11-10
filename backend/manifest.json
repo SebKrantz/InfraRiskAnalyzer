@@ -76,14 +76,17 @@
     "static/assets/The_World_Bank_logo-Du44aTYC.svg": {
       "checksum": "492c4982f8338c94d9818c037a306170"
     },
-    "static/assets/index-BYUo5XBo.css": {
-      "checksum": "849cb668ecc9df85f3858339144ba4ec"
+    "static/assets/index-BR87c6PW.css": {
+      "checksum": "d69715db8bb224249ee3d1ee90109747"
     },
-    "static/assets/index-sUTRcTou.js": {
-      "checksum": "c4febf265169b32eb0c65dda19c2504e"
+    "static/assets/index-Ts18nIEs.js": {
+      "checksum": "d4319f20bdfbffc9444c6e9e9d4ff7f4"
+    },
+    "static/assets/maplibre-gl-worker-Drh2vnPA.js": {
+      "checksum": "b47d5e903e329f8216d8c227d6bc2c69"
     },
     "static/index.html": {
-      "checksum": "84202abfa5127bdf364f352308561fc8"
+      "checksum": "dda594bb76ef8c59285cc26e5b964722"
     },
     "static/infra-risk-analyzer-guide.pdf": {
       "checksum": "52a56c8b5f89c7b9bcbf725f087fbf90"
