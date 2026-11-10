@@ -72,6 +72,7 @@ function App() {
       } catch (err) {
         if (cancelled) return
         console.error('Failed to fetch hazard statistics:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load hazard layer')
         // Fallback to default range if stats fail
         setHazardStats({ min: 0, max: 100 })
         thresholdLayer.current = null
@@ -130,10 +131,18 @@ function App() {
     setError(null)
   }
 
+  // Each run of the analysis effect supersedes the ones before it: a request still in
+  // flight from an earlier run must not put its result on screen afterwards (a slow
+  // layer answering after a faster one, or a result arriving after Clear Data)
+  const analysisRun = useRef(0)
+
   // Perform analysis when hazard, threshold, or vulnerability analysis changes
   useEffect(() => {
+    const run = ++analysisRun.current
+
     if (!uploadedFile || !selectedHazard) {
       setAnalysisResult(null)
+      setLoadingAnalysis(false)
       return
     }
 
@@ -149,6 +158,9 @@ function App() {
 
     if (vulnerabilityInputsIncomplete) {
       setAnalysisResult(null)
+      setLoadingAnalysis(false)
+      // An error from the previous inputs no longer applies
+      setError(null)
       return
     }
 
@@ -164,24 +176,25 @@ function App() {
         const result = await analyzeApi(
           uploadedFile.file_id,
           selectedHazard.id,
-          selectedHazard.url,
           threshold,
           vulnerabilityAnalysisEnabled ? vulnerabilityCurveFile : null,
           vulnerabilityAnalysisEnabled ? replacementValue : null
         )
+        if (run !== analysisRun.current) return
         setAnalysisResult(result)
       } catch (err) {
+        if (run !== analysisRun.current) return
         setError(err instanceof Error ? err.message : 'Failed to perform analysis')
         setAnalysisResult(null)
       } finally {
-        setLoadingAnalysis(false)
+        if (run === analysisRun.current) setLoadingAnalysis(false)
       }
     }
 
     // Debounce analysis calls
     const timeoutId = setTimeout(performAnalysis, 300)
     return () => clearTimeout(timeoutId)
-  }, [uploadedFile, selectedHazard, statsHazardId, intensityThreshold, vulnerabilityAnalysisEnabled, vulnerabilityCurveFile, replacementValue])
+  }, [uploadedFile, selectedHazard, statsHazardId, hazardStats, intensityThreshold, vulnerabilityAnalysisEnabled, vulnerabilityCurveFile, replacementValue])
 
   return (
     <div className="flex h-screen w-screen overflow-hidden m-0 p-0">
@@ -219,11 +232,9 @@ function App() {
         selectedHazard={selectedHazard}
         analysisResult={analysisResult}
         colorPalette={colorPalette}
-        intensityThreshold={intensityThreshold}
         hazardOpacity={hazardOpacity}
         basemap={basemap}
         onBasemapChange={setBasemap}
-        loadingAnalysis={loadingAnalysis}
         vulnerabilityAnalysisEnabled={vulnerabilityAnalysisEnabled}
         hazardStats={hazardStats}
       />
