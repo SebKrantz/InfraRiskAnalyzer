@@ -37,6 +37,7 @@ as Cloud Optimized GeoTIFFs from the UNEP/GRID server.
 
 - **Backend**: Python 3.10 or newer (3.11 recommended)
 - **Frontend**: Node.js 18 or newer to build (22 or 24 LTS recommended; the frontend tests need 22.18 or newer)
+- **Users**: a browser with WebGL 2 for the map (any current Chrome, Edge, Firefox or Safari)
 
 ### Backend
 
