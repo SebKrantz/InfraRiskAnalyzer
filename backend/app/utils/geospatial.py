@@ -251,10 +251,73 @@ def load_spatial_file(file_path: str) -> gpd.GeoDataFrame:
         # Fallback to fiona
         gdf = gpd.read_file(file_path)
     
-    # Ensure CRS is set (if not, assume WGS84)
+    # A file without a CRS (a shapefile without its .prj, say) is taken as WGS84 only
+    # when its coordinates can be longitude/latitude; projected metres would otherwise
+    # be read as degrees, land off every hazard layer and report nothing affected.
     if gdf.crs is None:
+        minx, miny, maxx, maxy = gdf.total_bounds
+        if not (-180 <= minx <= maxx <= 180 and -90 <= miny <= maxy <= 90):
+            raise ValueError(
+                "The file has no coordinate reference system (for a shapefile, the "
+                ".prj file is missing) and its coordinates are not longitude/latitude. "
+                "Include the .prj file, or reproject the data to WGS84 (EPSG:4326)."
+            )
         gdf.set_crs("EPSG:4326", inplace=True)
-    
+
+    return gdf
+
+
+def drop_missing_geometries(gdf: gpd.GeoDataFrame) -> Tuple[gpd.GeoDataFrame, int]:
+    """Drop features without a geometry (null or empty). Returns (gdf, number dropped)."""
+    missing = gdf.geometry.isna() | gdf.geometry.is_empty
+    dropped = int(missing.sum())
+    if dropped:
+        gdf = gdf.loc[~missing].reset_index(drop=True)
+    return gdf, dropped
+
+
+def explode_multipoints(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Split MultiPoint features into one point each, keeping their attributes.
+
+    The point analysis samples one location per feature, so a MultiPoint has to
+    become points before it reaches it; a layer that mixes Point and MultiPoint
+    is then a plain point layer.
+    """
+    if (gdf.geometry.geom_type == "MultiPoint").any():
+        gdf = gdf.explode(index_parts=False).reset_index(drop=True)
+    return gdf
+
+
+def json_safe_attributes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Turn attribute values JSON cannot carry (dates, times, bytes) into text.
+
+    The upload and analysis responses send every attribute to the browser as
+    GeoJSON; a date column (common in asset inventories) made both fail.
+    """
+    import datetime as _dt
+    import decimal as _decimal
+
+    def _cell(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        if isinstance(v, (pd.Timestamp, _dt.datetime, _dt.date, _dt.time)):
+            return None if pd.isna(v) else v.isoformat()
+        if isinstance(v, (pd.Timedelta, _dt.timedelta)):
+            return str(v)
+        if isinstance(v, _decimal.Decimal):
+            return float(v)
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return bytes(v).hex()
+        return v
+
+    for col in gdf.columns:
+        if col == gdf.geometry.name:
+            continue
+        s = gdf[col]
+        if pd.api.types.is_datetime64_any_dtype(s) or pd.api.types.is_timedelta64_dtype(s):
+            gdf[col] = s.astype(object).map(_cell)
+        elif s.dtype == object:
+            gdf[col] = s.map(_cell)
     return gdf
 
 
@@ -439,7 +502,8 @@ def parse_vulnerability_curve_data(
     if (proportion_destroyed < 0).any() or (proportion_destroyed > 1).any():
         raise ValueError("Proportion destroyed (central) values must be between 0 and 1")
 
-    sort_idx = np.argsort(intensity)
+    # Stable, so two rows at the same intensity (a step in the curve) keep their order
+    sort_idx = np.argsort(intensity, kind="stable")
     intensity = intensity[sort_idx]
     proportion_destroyed = proportion_destroyed[sort_idx]
 
@@ -465,16 +529,6 @@ def parse_vulnerability_curve_data(
         upper_interp = None
 
     return central_interp, intensity, proportion_destroyed, lower_interp, upper_interp
-
-
-def parse_vulnerability_curve(csv_path: str) -> Callable[[float], float]:
-    """
-    Parse a vulnerability curve CSV file and return an interpolation function.
-
-    CSV format: Two columns (intensity, proportion_destroyed)
-    """
-    interp, _, _, _, _ = parse_vulnerability_curve_data(csv_path)
-    return interp
 
 
 def sample_points_along_line(
@@ -532,6 +586,10 @@ def sample_points_along_line(
 # error of the inverse transform is ~1e-10 of a pixel at global scale; 1e-6 of a
 # 1/1200-degree pixel is 0.1 mm.
 _EDGE_TOL = 1e-6
+
+
+class HazardReadError(RuntimeError):
+    """Part of a hazard raster could not be read; the analysis cannot be trusted."""
 
 
 def sample_raster_at_points(
@@ -615,13 +673,17 @@ def sample_raster_at_points(
                 data = mask_raster_nodata(data, tile_src.nodata)
                 return idx, data[r - row_off, c - col_off]
         except Exception as exc:
-            # A failed read is unknown hazard, not absent hazard; say so, because
-            # NaN here silently becomes "unaffected" downstream.
+            # A failed read (a dropped connection to a remote layer, say) is unknown
+            # hazard, not absent hazard. Filled with NaN it became "unaffected" and was
+            # cached, so the analysis fails instead and can simply be run again.
             print(
                 f"Warning: could not read hazard raster window {window} "
                 f"({len(idx)} sample points): {type(exc).__name__}: {exc}"
             )
-            return idx, np.full(len(idx), np.nan)
+            raise HazardReadError(
+                "Could not read the hazard layer. Check the connection to the "
+                "server that hosts it and try again."
+            ) from exc
 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(groups))) as executor:
         for idx, vals in executor.map(process_tile, groups):

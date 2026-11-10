@@ -1,5 +1,5 @@
 """
-FastAPI backend for Hazard-Infrastructure Analyzer
+FastAPI backend for Infrastructure Risk Analyzer
 """
 
 import json
@@ -18,7 +18,7 @@ from app.api import upload, hazards, analyze, tiles, export
 from app.config import settings
 
 app = FastAPI(
-    title="Hazard-Infrastructure Analyzer API",
+    title="Infrastructure Risk Analyzer API",
     description="API for analyzing infrastructure assets against hazard layers",
     version="1.0.0"
 )
@@ -89,7 +89,7 @@ async def root():
     """Root endpoint"""
     if INDEX_PATH.exists():
         return _spa_index_response()
-    return {"message": "Hazard-Infrastructure Analyzer API", "version": "1.0.0"}
+    return {"message": "Infrastructure Risk Analyzer API", "version": "1.0.0"}
 
 
 @app.get("/health")
@@ -101,7 +101,8 @@ def _static_file_path(relative_path: str) -> Optional[Path]:
     """Resolve a path under STATIC_DIR, rejecting directory traversal."""
     static_root = STATIC_DIR.resolve()
     candidate = (STATIC_DIR / relative_path).resolve()
-    if not str(candidate).startswith(str(static_root)):
+    # A path test, not a string-prefix test: "static_old/..." starts with "static"
+    if not candidate.is_relative_to(static_root):
         return None
     return candidate if candidate.is_file() else None
 

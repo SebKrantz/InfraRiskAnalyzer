@@ -143,9 +143,8 @@ def _generate_tile_sync(
         img.save(img_buffer, format="PNG", optimize=False)
         return img_buffer.getvalue()
 
-    except (PermissionError, FileNotFoundError, OSError) as e:
-        # Raster path not readable or missing - propagate so endpoint can return 500
-        raise
+    # RasterioIOError is an OSError, so it is handled before the plain OSError clause
+    # below; in the other order the retry after a dropped connection never ran.
     except rasterio.errors.RasterioIOError as e:
         # If we failed on initial open (no dataset cached), propagate so user sees error
         if _open_failed():
@@ -173,6 +172,10 @@ def _generate_tile_sync(
         except Exception as retry_e:
             print(f"Tile generation error (retry failed) for z={z},x={x},y={y}: {type(retry_e).__name__}: {retry_e}")
             return _empty_tile()
+
+    except (PermissionError, FileNotFoundError, OSError) as e:
+        # Raster path not readable or missing - propagate so endpoint can return 500
+        raise
 
     except Exception as e:
         print(f"Tile generation error for z={z},x={x},y={y}: {type(e).__name__}: {e}")
@@ -254,11 +257,3 @@ async def get_tile(
             _tile_cache[cache_key] = tile_bytes
 
     return Response(content=tile_bytes, media_type="image/png")
-
-
-@router.post("/tiles/clear-cache")
-async def clear_tile_cache():
-    """Clear tile cache."""
-    with _tile_cache_lock:
-        _tile_cache.clear()
-    return {"message": "Tile cache cleared"}

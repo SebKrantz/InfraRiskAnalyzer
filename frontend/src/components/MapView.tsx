@@ -12,11 +12,9 @@ interface MapViewProps {
   selectedHazard: Hazard | null
   analysisResult: AnalysisResult | null
   colorPalette: ColorPalette
-  intensityThreshold: number
   hazardOpacity: number
   basemap: Basemap
   onBasemapChange: (basemap: Basemap) => void
-  loadingAnalysis?: boolean
   vulnerabilityAnalysisEnabled?: boolean
   hazardStats?: { min: number; max: number } | null
 }
@@ -250,11 +248,9 @@ export default function MapView({
   selectedHazard,
   analysisResult,
   colorPalette,
-  intensityThreshold: _intensityThreshold,
   hazardOpacity,
   basemap,
   onBasemapChange,
-  loadingAnalysis: _loadingAnalysis = false,
   vulnerabilityAnalysisEnabled = false,
   hazardStats = null,
 }: MapViewProps) {
@@ -282,11 +278,20 @@ export default function MapView({
   // Store current prop values for restoration
   const currentProps = useRef({ uploadedFile, selectedHazard, analysisResult, hazardOpacity, colorPalette, vulnerabilityAnalysisEnabled, maxVulnerability })
   
-  // Track zoom level and bounds to prevent unnecessary reloads
-  const lastZoomLevel = useRef<number | null>(null)
+  // Track bounds to prevent unnecessary reloads
   const lastBounds = useRef<string | null>(null)
   const boundsSetForFile = useRef<string | null>(null)
-  const debounceTimer = useRef<NodeJS.Timeout | null>(null)
+  // One timer per job: the hazard-layer debounce and the zoom-to-data delay used to
+  // share one, so each effect's cleanup could cancel the other's.
+  const hazardTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const fitBoundsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // True once the current style can take sources and layers: from 'load' / 'style.load'
+  // until the next setStyle. map.isStyleLoaded() is no use for this, because it stays
+  // false while any tile is still loading, so updates queued behind it piled up.
+  const styleReady = useRef(false)
+  // The listeners added for each infrastructure layer, so they can be removed again:
+  // map.off() without the listener removes nothing.
+  const popupHandlers = useRef<Record<string, { click: any; enter: any; leave: any }>>({})
   
   // Update refs when props change
   useEffect(() => {
@@ -321,12 +326,8 @@ export default function MapView({
       )
 
       map.current.on('load', () => {
-        console.log('Map loaded successfully')
+        styleReady.current = true
         setMapLoaded(true)
-        // Track initial zoom level
-        if (map.current) {
-          lastZoomLevel.current = map.current.getZoom()
-        }
       })
 
       map.current.on('error', (e: any) => {
@@ -334,28 +335,14 @@ export default function MapView({
       })
 
       map.current.on('style.load', () => {
-        console.log('Map style loaded')
+        styleReady.current = true
         setMapLoaded(true)
-        // Track zoom level after style load
-        if (map.current) {
-          lastZoomLevel.current = map.current.getZoom()
-        }
       })
 
       map.current.on('style.error', (e: any) => {
         console.error('Map style error:', e)
       })
-      
-      // Track zoom changes to detect when tiles should reload
-      map.current.on('zoom', () => {
-        if (map.current) {
-          const currentZoom = Math.floor(map.current.getZoom())
-          if (lastZoomLevel.current !== null && Math.floor(lastZoomLevel.current) !== currentZoom) {
-            // Zoom level changed - tiles will reload naturally, just track it
-            lastZoomLevel.current = currentZoom
-          }
-        }
-      })
+
     } catch (error) {
       console.error('Error initializing map:', error)
     }
@@ -367,11 +354,9 @@ export default function MapView({
         popup.current = null
       }
       
-      // Clean up debounce timer
-      if (debounceTimer.current) {
-        clearTimeout(debounceTimer.current)
-        debounceTimer.current = null
-      }
+      // Clean up timers
+      if (hazardTimer.current) clearTimeout(hazardTimer.current)
+      if (fitBoundsTimer.current) clearTimeout(fitBoundsTimer.current)
       
       if (map.current) {
         map.current.remove()
@@ -383,7 +368,8 @@ export default function MapView({
   // Deterministic layer helpers for toggling
   const ensureStyleLoaded = (cb: () => void) => {
     const tryRun = () => {
-      if (map.current?.isStyleLoaded()) cb()
+      if (!map.current) return
+      if (styleReady.current) cb()
       else setTimeout(tryRun, 50)
     }
     tryRun()
@@ -417,7 +403,8 @@ export default function MapView({
   // Add popup click handlers to infrastructure layers
   const addPopupHandlers = (layerId: string) => {
     if (!map.current) return
-    
+    removePopupHandlers(layerId)
+
     const handleClick = (e: maplibregl.MapLayerMouseEvent) => {
       if (!map.current || !e.features || e.features.length === 0) return
       
@@ -437,33 +424,37 @@ export default function MapView({
         maxWidth: '300px',
       })
         .setLngLat(coordinates)
-        .setHTML(formatFeatureProperties(properties, vulnerabilityAnalysisEnabled, selectedHazard?.unit))
+        .setHTML(formatFeatureProperties(
+          properties,
+          !!currentProps.current.vulnerabilityAnalysisEnabled,
+          currentProps.current.selectedHazard?.unit,
+        ))
         .addTo(map.current)
     }
-    
+
+    // Change cursor on hover
+    const handleEnter = () => {
+      if (map.current) map.current.getCanvas().style.cursor = 'pointer'
+    }
+    const handleLeave = () => {
+      if (map.current) map.current.getCanvas().style.cursor = ''
+    }
+
     // Use type assertion for layer-specific event handlers
     ;(map.current.on as any)('click', layerId, handleClick)
-    
-    // Change cursor on hover
-    ;(map.current.on as any)('mouseenter', layerId, () => {
-      if (map.current) {
-        map.current.getCanvas().style.cursor = 'pointer'
-      }
-    })
-    
-    ;(map.current.on as any)('mouseleave', layerId, () => {
-      if (map.current) {
-        map.current.getCanvas().style.cursor = ''
-      }
-    })
+    ;(map.current.on as any)('mouseenter', layerId, handleEnter)
+    ;(map.current.on as any)('mouseleave', layerId, handleLeave)
+    popupHandlers.current[layerId] = { click: handleClick, enter: handleEnter, leave: handleLeave }
   }
 
   // Remove popup click handlers from infrastructure layers
   const removePopupHandlers = (layerId: string) => {
-    if (!map.current) return
-    ;(map.current.off as any)('click', layerId)
-    ;(map.current.off as any)('mouseenter', layerId)
-    ;(map.current.off as any)('mouseleave', layerId)
+    const handlers = popupHandlers.current[layerId]
+    if (!map.current || !handlers) return
+    ;(map.current.off as any)('click', layerId, handlers.click)
+    ;(map.current.off as any)('mouseenter', layerId, handlers.enter)
+    ;(map.current.off as any)('mouseleave', layerId, handlers.leave)
+    delete popupHandlers.current[layerId]
   }
 
   const removeInfrastructure = () => {
@@ -527,20 +518,21 @@ export default function MapView({
       if (hasAffected) {
         const needsGradientLayer = isVulnMode
           || (isPoint ? (props.analysisResult?.summary?.affected_count || 0) > 0 : (props.analysisResult?.summary?.affected_meters || 0) > 0)
+        // Unaffected first, affected on top, as the infrastructure effect below draws them
         if (isPoint) {
           map.current.addLayer({ id: layerId, type: 'circle', source: sourceId, filter: style.unaffectedFilter, paint: { 'circle-radius': 5, 'circle-color': style.unaffectedColor, 'circle-opacity': 0.8 } })
+          map.current.moveLayer(layerId)
           if (needsGradientLayer) {
             map.current.addLayer({ id: affectedLayerId, type: 'circle', source: sourceId, filter: style.affectedFilter, paint: { 'circle-radius': 5, 'circle-color': style.affectedColor, 'circle-opacity': 0.8 } })
             map.current.moveLayer(affectedLayerId)
           }
-          map.current.moveLayer(layerId)
         } else {
           map.current.addLayer({ id: layerId, type: 'line', source: sourceId, filter: style.unaffectedFilter, paint: { 'line-color': style.unaffectedColor, 'line-width': 3, 'line-opacity': 0.8 } })
+          map.current.moveLayer(layerId)
           if (needsGradientLayer) {
             map.current.addLayer({ id: affectedLayerId, type: 'line', source: sourceId, filter: style.affectedFilter, paint: { 'line-color': style.affectedColor, 'line-width': 3, 'line-opacity': 0.8 } })
             map.current.moveLayer(affectedLayerId)
           }
-          map.current.moveLayer(layerId)
         }
       } else {
         if (isPoint) map.current.addLayer({ id: layerId, type: 'circle', source: sourceId, paint: { 'circle-radius': 5, 'circle-color': '#6b7280', 'circle-opacity': 0.8 } })
@@ -559,280 +551,12 @@ export default function MapView({
     } catch (e) { console.error('addInfrastructure error:', e) }
   }
 
-  // Update basemap - preserve existing layers
-  useEffect(() => {
-    if (!map.current || !mapLoaded) return
-    
-    // Use current prop values from refs
-    const props = currentProps.current
-    
-    // Check if we have any layers to preserve
-    const hasInfrastructure = props.uploadedFile && (props.analysisResult?.infrastructure_features || props.uploadedFile.geojson)
-    const hasHazard = props.selectedHazard !== null
-    
-    if (!hasInfrastructure && !hasHazard) {
-      // No layers to preserve, just change basemap
-      map.current.setStyle(basemapStyles[basemap])
-      return
-    }
-    
-    // Store what we need to restore in a closure-safe way
-    const needsRestore = {
-      infrastructure: hasInfrastructure,
-      hazard: hasHazard,
-      geoJson: props.analysisResult?.infrastructure_features || props.uploadedFile?.geojson || null,
-      isPoint: props.analysisResult?.geometry_type === 'Point' || props.uploadedFile?.geometry_type === 'Point',
-      hasAffected: !!(props.analysisResult?.infrastructure_features),
-      hazardId: props.selectedHazard?.id,
-      hazardOpacity: props.hazardOpacity,
-      colorPalette: props.colorPalette,
-      analysisResult: props.analysisResult,
-      vulnerabilityAnalysisEnabled: !!props.vulnerabilityAnalysisEnabled,
-      maxVulnerability: props.maxVulnerability,
-    }
-    
-    // Function to restore layers
-    const restoreLayers = () => {
-      if (!map.current || !map.current.isStyleLoaded()) {
-        setTimeout(restoreLayers, 100)
-        return
-      }
-      
-      // Restore hazard layer first if needed
-      if (needsRestore.hazard && needsRestore.hazardId) {
-        try {
-          const hazardSourceId = 'hazard-raster-source'
-          const hazardLayerId = 'hazard-raster-layer'
-          const tileUrl = `${API_BASE_URL}/tiles/${needsRestore.hazardId}/{z}/{x}/{y}.png?palette=${needsRestore.colorPalette}`
-          
-          // Remove if exists
-          if (map.current.getLayer(hazardLayerId)) {
-            map.current.removeLayer(hazardLayerId)
-          }
-          if (map.current.getSource(hazardSourceId)) {
-            map.current.removeSource(hazardSourceId)
-          }
-          
-          // Add source and layer
-          map.current.addSource(hazardSourceId, {
-            type: 'raster',
-            tiles: [tileUrl],
-            tileSize: 256,
-          })
-          
-          map.current.addLayer({
-            id: hazardLayerId,
-            type: 'raster',
-            source: hazardSourceId,
-            paint: {
-              'raster-opacity': needsRestore.hazardOpacity / 100,
-            },
-          })
-          
-          // Apply visibility state
-          if (!hazardVisible) {
-            map.current.setLayoutProperty(hazardLayerId, 'visibility', 'none')
-          }
-        } catch (e) {
-          console.error('Error restoring hazard layer:', e)
-        }
-      }
-      
-      // Restore infrastructure layer
-      if (needsRestore.infrastructure && needsRestore.geoJson) {
-        try {
-          const sourceId = 'infrastructure-source'
-          const layerId = 'infrastructure-layer'
-          const affectedLayerId = 'infrastructure-affected'
-          
-          // Remove existing layers
-          if (map.current.getLayer(affectedLayerId)) {
-            map.current.removeLayer(affectedLayerId)
-          }
-          if (map.current.getLayer(layerId)) {
-            map.current.removeLayer(layerId)
-          }
-          if (map.current.getSource(sourceId)) {
-            map.current.removeSource(sourceId)
-          }
-          
-          // Add source
-          map.current.addSource(sourceId, {
-            type: 'geojson',
-            data: needsRestore.geoJson,
-          })
-          
-          // Add layers based on whether we have affected status
-          const isRestoreVulnMode = needsRestore.vulnerabilityAnalysisEnabled && needsRestore.hasAffected
-          const restoreStyle = getInfraStyle(isRestoreVulnMode, needsRestore.maxVulnerability)
-          if (needsRestore.hasAffected) {
-            const needsGradientLayer = isRestoreVulnMode
-              || (needsRestore.isPoint
-                ? (needsRestore.analysisResult?.summary?.affected_count || 0) > 0
-                : (needsRestore.analysisResult?.summary?.affected_meters || 0) > 0)
-            if (needsRestore.isPoint) {
-                map.current.addLayer({
-                  id: layerId,
-                  type: 'circle',
-                  source: sourceId,
-                  filter: restoreStyle.unaffectedFilter,
-                  paint: {
-                    'circle-radius': 5,
-                    'circle-color': restoreStyle.unaffectedColor,
-                    'circle-opacity': 0.8,
-                  },
-                })
-                
-                if (!infrastructureVisible) {
-                  map.current.setLayoutProperty(layerId, 'visibility', 'none')
-                }
-                
-                if (needsGradientLayer) {
-                  map.current.addLayer({
-                    id: affectedLayerId,
-                    type: 'circle',
-                    source: sourceId,
-                    filter: restoreStyle.affectedFilter,
-                    paint: {
-                      'circle-radius': 5,
-                      'circle-color': restoreStyle.affectedColor,
-                      'circle-opacity': 0.8,
-                    },
-                  })
-                  
-                  if (!infrastructureVisible) {
-                    map.current.setLayoutProperty(affectedLayerId, 'visibility', 'none')
-                  }
-                }
-            } else {
-              map.current.addLayer({
-                id: layerId,
-                type: 'line',
-                source: sourceId,
-                filter: restoreStyle.unaffectedFilter,
-                paint: {
-                  'line-color': restoreStyle.unaffectedColor,
-                  'line-width': 3,
-                  'line-opacity': 0.8,
-                },
-              })
-              
-              if (!infrastructureVisible) {
-                map.current.setLayoutProperty(layerId, 'visibility', 'none')
-              }
-              
-              if (needsGradientLayer) {
-                map.current.addLayer({
-                  id: affectedLayerId,
-                  type: 'line',
-                  source: sourceId,
-                  filter: restoreStyle.affectedFilter,
-                  paint: {
-                    'line-color': restoreStyle.affectedColor,
-                    'line-width': 3,
-                    'line-opacity': 0.8,
-                  },
-                })
-                
-                if (!infrastructureVisible) {
-                  map.current.setLayoutProperty(affectedLayerId, 'visibility', 'none')
-                }
-              }
-              
-              addPopupHandlers(layerId)
-              if (map.current.getLayer(affectedLayerId)) {
-                addPopupHandlers(affectedLayerId)
-              }
-            }
-          } else {
-            // No analysis yet - show all features in dark grey
-            if (needsRestore.isPoint) {
-              map.current.addLayer({
-                id: layerId,
-                type: 'circle',
-                source: sourceId,
-                paint: {
-                  'circle-radius': 5,
-                  'circle-color': '#6b7280',
-                  'circle-opacity': 0.8,
-                },
-              })
-              
-              // Apply visibility state
-              if (!infrastructureVisible) {
-                map.current.setLayoutProperty(layerId, 'visibility', 'none')
-              }
-            } else {
-              map.current.addLayer({
-                id: layerId,
-                type: 'line',
-                source: sourceId,
-                paint: {
-                  'line-color': '#6b7280',
-                  'line-width': 3,
-                  'line-opacity': 0.8,
-                },
-              })
-              
-              // Apply visibility state
-              if (!infrastructureVisible) {
-                map.current.setLayoutProperty(layerId, 'visibility', 'none')
-              }
-            }
-            
-            // Add popup handlers
-            addPopupHandlers(layerId)
-            if (map.current.getLayer(affectedLayerId)) {
-              addPopupHandlers(affectedLayerId)
-            }
-          }
-        } catch (e) {
-          console.error('Error restoring infrastructure layer:', e)
-        }
-      }
-      
-      // Apply visibility states after restoration
-      setTimeout(() => {
-        if (map.current) {
-          applyInfrastructureVisibility(infrastructureVisible)
-          applyHazardVisibility(hazardVisible)
-        }
-      }, 150)
-      
-      isRestoringLayers.current = false
-    }
-    
-    isRestoringLayers.current = true
-    
-    // Listen for style load
-    const handleStyleLoad = () => {
-      setTimeout(restoreLayers, 100)
-    }
-    
-    map.current.once('style.load', handleStyleLoad)
-    
-    // Also try after a delay in case the event doesn't fire
-    const timeoutId = setTimeout(() => {
-      if (isRestoringLayers.current) {
-        restoreLayers()
-      }
-    }, 1000)
-    
-    // Change the style
-    map.current.setStyle(basemapStyles[basemap])
-    
-    // Cleanup timeout if style.load fires
-    map.current.once('style.load', () => {
-      clearTimeout(timeoutId)
-    })
-  }, [basemap, mapLoaded])
-
   // Reset bounds tracking when file changes
+  const uploadedFileId = uploadedFile?.file_id
   useEffect(() => {
-    if (uploadedFile) {
+    if (uploadedFileId) {
       // Reset bounds tracking when a new file is uploaded
-      const fileId = uploadedFile.file_id
-      if (boundsSetForFile.current !== fileId) {
+      if (boundsSetForFile.current !== uploadedFileId) {
         lastBounds.current = null
       }
     } else {
@@ -840,7 +564,7 @@ export default function MapView({
       boundsSetForFile.current = null
       lastBounds.current = null
     }
-  }, [uploadedFile?.file_id])
+  }, [uploadedFileId])
 
   // Add/update hazard raster layer
   useEffect(() => {
@@ -865,14 +589,18 @@ export default function MapView({
     const hazardSourceId = 'hazard-raster-source'
     const hazardLayerId = 'hazard-raster-layer'
 
-    // Debounce hazard layer updates to prevent rapid successive reloads
-    if (debounceTimer.current) {
-      clearTimeout(debounceTimer.current)
+    // Debounce hazard layer updates to prevent rapid successive reloads. A wait still
+    // pending when the effect runs again is dropped, so an older update can never land
+    // after a newer one.
+    let cancelled = false
+    if (hazardTimer.current) {
+      clearTimeout(hazardTimer.current)
     }
-    
-    debounceTimer.current = setTimeout(() => {
+
+    hazardTimer.current = setTimeout(() => {
       const waitForStyleAndAddHazard = () => {
-        if (!map.current?.isStyleLoaded()) {
+        if (cancelled || !map.current) return
+        if (!styleReady.current || isRestoringLayers.current) {
           setTimeout(waitForStyleAndAddHazard, 100)
           return
         }
@@ -982,11 +710,12 @@ export default function MapView({
 
       waitForStyleAndAddHazard()
     }, 100) // Debounce delay
-    
+
     // Cleanup function
     return () => {
-      if (debounceTimer.current) {
-        clearTimeout(debounceTimer.current)
+      cancelled = true
+      if (hazardTimer.current) {
+        clearTimeout(hazardTimer.current)
       }
     }
   }, [selectedHazard, hazardOpacity, colorPalette, mapLoaded, hazardVisible])
@@ -1030,8 +759,12 @@ export default function MapView({
     const layerId = 'infrastructure-layer'
     const affectedLayerId = 'infrastructure-affected'
 
+    // As for the hazard layer: a wait still pending when the effect runs again is
+    // dropped, so the map cannot end up showing an older result than the chart.
+    let cancelled = false
     const waitForStyle = () => {
-      if (!map.current?.isStyleLoaded()) {
+      if (cancelled || !map.current) return
+      if (!styleReady.current || isRestoringLayers.current) {
         setTimeout(waitForStyle, 100)
         return
       }
@@ -1283,10 +1016,10 @@ export default function MapView({
               bounds.maxy
             ]
             // Debounce fitBounds to avoid rapid successive calls
-            if (debounceTimer.current) {
-              clearTimeout(debounceTimer.current)
+            if (fitBoundsTimer.current) {
+              clearTimeout(fitBoundsTimer.current)
             }
-            debounceTimer.current = setTimeout(() => {
+            fitBoundsTimer.current = setTimeout(() => {
               if (map.current) {
                 map.current.fitBounds(bbox, { padding: 50, duration: 0 }) // duration: 0 prevents animation that can trigger tile reloads
                 boundsSetForFile.current = fileId
@@ -1308,10 +1041,10 @@ export default function MapView({
               bounds.maxx,
               bounds.maxy
             ]
-            if (debounceTimer.current) {
-              clearTimeout(debounceTimer.current)
+            if (fitBoundsTimer.current) {
+              clearTimeout(fitBoundsTimer.current)
             }
-            debounceTimer.current = setTimeout(() => {
+            fitBoundsTimer.current = setTimeout(() => {
               if (map.current) {
                 map.current.fitBounds(bbox, { padding: 50, duration: 0 })
                 boundsSetForFile.current = fileId
@@ -1333,10 +1066,10 @@ export default function MapView({
             bounds.maxx,
             bounds.maxy
           ]
-          if (debounceTimer.current) {
-            clearTimeout(debounceTimer.current)
+          if (fitBoundsTimer.current) {
+            clearTimeout(fitBoundsTimer.current)
           }
-          debounceTimer.current = setTimeout(() => {
+          fitBoundsTimer.current = setTimeout(() => {
             if (map.current) {
               map.current.fitBounds(bbox, { padding: 50, duration: 0 })
               boundsSetForFile.current = fileId
@@ -1348,50 +1081,45 @@ export default function MapView({
     }
 
     waitForStyle()
-    
+
     // Cleanup function
     return () => {
-      if (debounceTimer.current) {
-        clearTimeout(debounceTimer.current)
+      cancelled = true
+      if (fitBoundsTimer.current) {
+        clearTimeout(fitBoundsTimer.current)
       }
     }
+    // The layer helpers are recreated on every render and read the current props through refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uploadedFile, analysisResult, mapLoaded, infrastructureVisible, vulnerabilityAnalysisEnabled, maxVulnerability])
 
-  // Basemap style switcher (always on)
+  // Basemap style switcher. The style is replaced in full (diff: false), so 'style.load'
+  // always fires; a diffed setStyle applied the change in place without it, and the
+  // layers came back only through a one-second fallback that re-applied a snapshot
+  // taken at the moment of the switch. The layers are re-added from the props as they
+  // are when the new style is ready. Until then the layer effects below hold back.
+  const lastBasemap = useRef<Basemap>('positron')
   useEffect(() => {
     if (!map.current || !mapLoaded) return
-    
-    // Use current prop values from refs
-    const props = currentProps.current
-    const hasInfrastructure = props.uploadedFile && (props.analysisResult?.infrastructure_features || props.uploadedFile.geojson)
-    const hasHazard = props.selectedHazard !== null
-    
-    if (!hasInfrastructure && !hasHazard) {
-      map.current.setStyle(basemapStyles[basemap])
-      return
-    }
-    
-    // Preserve layers similar to earlier logic
+    if (lastBasemap.current === basemap) return
+    lastBasemap.current = basemap
+
     isRestoringLayers.current = true
-    const needsRestore = {
-      infrastructure: hasInfrastructure,
-      hazard: hasHazard,
+    styleReady.current = false
+    const m = map.current
+    const restore = () => {
+      isRestoringLayers.current = false
+      if (!map.current) return
+      const props = currentProps.current
+      if (props.selectedHazard && hazardVisible) addHazard()
+      if (props.uploadedFile && infrastructureVisible) addInfrastructure()
     }
-    
-    const restoreAfterStyle = () => {
-      setTimeout(() => {
-        if (!map.current) {
-          isRestoringLayers.current = false
-          return
-        }
-        if (needsRestore.hazard && currentProps.current.selectedHazard) addHazard()
-        if (needsRestore.infrastructure && currentProps.current.uploadedFile) addInfrastructure()
-        isRestoringLayers.current = false
-      }, 100)
-    }
-    
-    map.current.once('style.load', restoreAfterStyle)
-    map.current.setStyle(basemapStyles[basemap])
+    // A later switch's restore re-adds from the latest props too, so an earlier one
+    // that still fires does no harm
+    m.once('style.load', restore)
+    m.setStyle(basemapStyles[basemap], { diff: false })
+    // Runs on a basemap change only; the restore reads everything else when it fires
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [basemap, mapLoaded])
 
   // Helper function to apply infrastructure visibility
@@ -1413,50 +1141,12 @@ export default function MapView({
     }
   }
 
-  // Toggle infrastructure layer visibility
+  // Toggle infrastructure layer visibility. The layers are shown or hidden, not removed:
+  // the infrastructure effect above adds them, and re-adds them when the data changes.
   useEffect(() => {
     if (!map.current || !mapLoaded) return
-    ensureStyleLoaded(() => {
-      if (!map.current) return
-      if (!infrastructureVisible) {
-        removeInfrastructure()
-      } else {
-        // Only call addInfrastructure if we don't have layers yet
-        // The main infrastructure useEffect handles updates when analysisResult changes
-        const layerId = 'infrastructure-layer'
-        if (uploadedFile && !map.current.getLayer(layerId)) {
-          addInfrastructure()
-        }
-      }
-    })
-  }, [infrastructureVisible, mapLoaded, uploadedFile])
-
-  // Helper function to apply hazard visibility
-  const applyHazardVisibility = (visible: boolean) => {
-    if (!map.current) return
-    
-    const hazardLayerId = 'hazard-raster-layer'
-    
-    try {
-      if (map.current.getLayer(hazardLayerId)) {
-        map.current.setLayoutProperty(hazardLayerId, 'visibility', visible ? 'visible' : 'none')
-      }
-    } catch (error) {
-      console.error('Error applying hazard visibility:', error)
-    }
-  }
-
-  // Toggle hazard layer visibility
-  useEffect(() => {
-    if (!map.current || !mapLoaded) return
-    ensureStyleLoaded(() => {
-      if (!hazardVisible) {
-        removeHazard()
-      } else {
-        if (selectedHazard) addHazard()
-      }
-    })
-  }, [hazardVisible, mapLoaded, selectedHazard, colorPalette, hazardOpacity])
+    ensureStyleLoaded(() => applyInfrastructureVisibility(infrastructureVisible))
+  }, [infrastructureVisible, mapLoaded])
 
   // Reset visibility when layers are added/removed
   useEffect(() => {

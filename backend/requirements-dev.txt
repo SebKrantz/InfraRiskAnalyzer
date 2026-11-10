@@ -1,0 +1,5 @@
+# For running the tests: pip install -r requirements-dev.txt, then
+# cd backend && python -m pytest   (or: python -m unittest discover -s tests)
+-r requirements.txt
+httpx        # FastAPI's TestClient
+pytest

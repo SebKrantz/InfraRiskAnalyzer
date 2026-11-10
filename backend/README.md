@@ -1,298 +1,94 @@
-# Hazard-Infrastructure Analyzer - Backend
+# Infrastructure Risk Analyzer — Backend
 
-FastAPI backend for analyzing infrastructure assets against hazard layers.
+FastAPI backend: it parses uploads, renders hazard map tiles, runs the exposure and damage analysis, and
+writes the exports. Uploads and results are held in memory only, so run it as a single process
+(`--workers 1`). Configuration, the hazard catalogue and production deployment are described in the
+[root README](../README.md) and the technical guide in `../docs/`.
 
 ## Setup
 
-### Prerequisites
-
-- Python 3.9 or higher
-- pip or conda
-
-### Installation
-
-1. Create a virtual environment (recommended):
+Python 3.10 or newer (3.11 recommended). The rasterio and pyogrio wheels bundle GDAL, so no system GDAL is
+needed.
 
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-2. Install dependencies:
-
-```bash
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env              # then set CARTO_API_KEY in it
 ```
 
-### Configuration
-
-The application uses environment variables for configuration (with defaults):
-
-- `HOST`: Server host (default: `0.0.0.0`)
-- `PORT`: Server port (default: `8000`)
-- `DEBUG`: Debug mode (default: `False`)
-
-### Data Setup
-
-1. Create a `data` directory in the project root:
-```bash
-mkdir -p data
-```
-
-2. Create `data/hazard_layers.csv` with the following structure (semicolon-delimited):
-
-```csv
-hazard;dataset_url;description;background_paper
-Flood Hazard 10 Years - Existing climate;https://hazards-data.unepgrid.ch/global_pc_h10glob.tif;Description text;Background paper URL
-```
-
-Required columns:
-- `hazard`: Display name (used to generate unique ID)
-- `dataset_url`: URL or path to Cloud Optimized GeoTIFF (COG)
-
-Optional columns:
-- `description`: Description of the hazard
-- `background_paper`: URL or path to background paper/metadata
-
-**Note:** The CSV file uses semicolon (`;`) as delimiter, not comma.
-
-## Running the Server
-
-### Development Mode
-
-From the `backend` directory:
+## Running
 
 ```bash
-python main.py
+python main.py                                       # development; DEBUG=true for auto-reload
+uvicorn main:app --reload --host 0.0.0.0 --port 8000 # the same with uvicorn
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1   # production
 ```
 
-Or using uvicorn directly:
+The API is at `http://localhost:8000`, with interactive documentation (Swagger UI) at
+`http://localhost:8000/docs` and ReDoc at `http://localhost:8000/redoc`.
 
-```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
+## Trying the API with curl
 
-The API will be available at `http://localhost:8000`
-
-### Production Mode
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-```
-
-> **Note**: Use `--workers 1` as the application uses in-memory state for uploaded files and analysis caching. Multi-worker deployment would require Redis or similar for shared state.
-
-## API Endpoints
-
-### Health Check
-- `GET /health` - Health check endpoint
-- `GET /` - API information
-
-### Upload
-- `POST /api/upload` - Upload spatial file (Shapefile, GeoPackage, or CSV with coordinates)
-  - Accepts: 
-    - `.shp` (zipped shapefile)
-    - `.gpkg` (GeoPackage)
-    - `.csv` (with point coordinates - see below)
-  - Returns: File metadata with geometry type and bounds
-  - **CSV Format**: CSV files must contain coordinate columns. Supported column name variations (case-agnostic):
-    - `lat`/`lon`, `lat`/`lng`, `latitude`/`longitude`
-    - `y`/`x` (where y = latitude, x = longitude)
-    - Missing coordinates are automatically dropped
-    - Coordinates are validated (lat: -90 to 90, lon: -180 to 180)
-
-- `GET /api/upload/{file_id}` - Get upload metadata
-- `DELETE /api/upload/{file_id}` - Delete uploaded file
-
-### Hazards
-- `GET /api/hazards` - Get list of available hazard layers
-- `GET /api/hazards/{hazard_id}` - Get specific hazard layer info
-
-### Analysis
-- `POST /api/analyze` - Analyze intersections between infrastructure and hazards
-  - Body: `{file_id, hazard_id, hazard_url, intensity_threshold?}`
-  - Returns: Summary statistics (counts/meters affected)
-
-- `GET /api/analyze/{file_id}/status` - Get analysis status
-
-## API Documentation
-
-Once the server is running, interactive API documentation is available at:
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-
-## Testing the API Endpoints
-
-### Method 1: Using Swagger UI (Recommended)
-
-The easiest way to test the API is using the built-in Swagger UI:
-
-1. Start the server: `python main.py`
-2. Open your browser and go to: `http://localhost:8000/docs`
-3. You'll see an interactive interface where you can:
-   - See all available endpoints
-   - Test each endpoint directly in the browser
-   - See request/response schemas
-   - Try out file uploads
-
-### Method 2: Using curl Commands
-
-You can test endpoints from the command line using `curl`:
-
-#### Health Check
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8000/
+curl http://localhost:8000/api/hazards                 # the layer IDs, e.g. flood_hazard_100_years_existing_climate
+
+# Upload: a zipped shapefile, a GeoPackage, a GeoJSON or a CSV with lon/lat columns
+curl -F "file=@towers.csv" http://localhost:8000/api/upload          # returns a file_id
+
+# Exposure at a threshold (in the layer's unit, here mm of flood depth)
+curl -X POST http://localhost:8000/api/analyze -H "Content-Type: application/json" \
+  -d '{"file_id": "<file_id>", "hazard_id": "flood_hazard_100_years_existing_climate", "intensity_threshold": 500}'
+
+# Exposure and damage: a curve CSV and a replacement value (per asset for points, per metre for lines)
+curl -X POST http://localhost:8000/api/analyze \
+  -F file_id=<file_id> -F hazard_id=flood_hazard_100_years_existing_climate \
+  -F intensity_threshold=500 -F replacement_value=100000 -F "vulnerability_curve_file=@curve.csv"
+
+# The results of that analysis as CSV
+curl -X POST http://localhost:8000/api/export/data -H "Content-Type: application/json" -o results.csv \
+  -d '{"file_id": "<file_id>", "hazard_id": "flood_hazard_100_years_existing_climate", "intensity_threshold": 500, "mode": "csv_points"}'
+
+curl -X DELETE http://localhost:8000/api/upload/<file_id>
 ```
 
-#### Get Hazard Layers
-```bash
-# Get all hazards
-curl http://localhost:8000/api/hazards
+The hazard raster is always the one the catalogue lists for `hazard_id`; a `hazard_url` sent by older
+clients is ignored. An export needs the analysis at the same threshold to have run first.
 
-# Get specific hazard (use the generated ID from the list above)
-curl http://localhost:8000/api/hazards/flood_hazard_10_years_existing_climate
-```
-
-#### Upload File
-```bash
-# Upload a Shapefile (zipped)
-curl -X POST "http://localhost:8000/api/upload" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@path/to/your/shapefile.zip;type=application/zip"
-
-# Upload a GeoPackage
-curl -X POST "http://localhost:8000/api/upload" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@path/to/your/data.gpkg"
-
-# Upload a CSV file with coordinates
-# CSV should have columns like: lat,lon or latitude,longitude or y,x
-curl -X POST "http://localhost:8000/api/upload" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@path/to/your/points.csv;type=text/csv"
-
-# The response will include a file_id that you'll need for analysis
-```
-
-#### Get Upload Info
-```bash
-# Replace {file_id} with the ID from upload response
-curl http://localhost:8000/api/upload/{file_id}
-```
-
-#### Analyze Intersections
-```bash
-# Replace {file_id} with your uploaded file ID
-# Replace {hazard_id} with a hazard ID from /api/hazards
-# Replace {hazard_url} with the URL from the hazard info
-curl -X POST "http://localhost:8000/api/analyze" \
-  -H "accept: application/json" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "file_id": "your-file-id",
-    "hazard_id": "flood_hazard_10_years_existing_climate",
-    "hazard_url": "https://hazards-data.unepgrid.ch/global_pc_h10glob.tif",
-    "intensity_threshold": 0.5
-  }'
-```
-
-#### Get Analysis Status
-```bash
-curl http://localhost:8000/api/analyze/{file_id}/status
-```
-
-### Method 3: Using HTTPie (if installed)
-
-HTTPie provides a more readable syntax:
+## Tests
 
 ```bash
-# Install: pip install httpie
-
-# Get hazards
-http GET http://localhost:8000/api/hazards
-
-# Upload file
-http -f POST http://localhost:8000/api/upload file@path/to/file.gpkg
-
-# Analyze
-http POST http://localhost:8000/api/analyze \
-  file_id=your-file-id \
-  hazard_id=flood_hazard_10_years_existing_climate \
-  hazard_url=https://hazards-data.unepgrid.ch/global_pc_h10glob.tif \
-  intensity_threshold:=0.5
+pip install -r requirements-dev.txt
+python -m pytest                  # or: python -m unittest discover -s tests
 ```
 
-### Method 4: Using Python requests
+`tests/test_privacy.py` covers what happens to uploaded data (nothing on disk, expiry, deletion, no CORS
+grant); `tests/test_analysis.py` covers uploads, the analysis and the exports against a small local raster.
 
-You can also test programmatically with Python:
-
-```python
-import requests
-
-# Health check
-response = requests.get("http://localhost:8000/health")
-print(response.json())
-
-# Get hazards
-response = requests.get("http://localhost:8000/api/hazards")
-hazards = response.json()
-print(hazards)
-
-# Upload file
-with open("path/to/file.gpkg", "rb") as f:
-    files = {"file": f}
-    response = requests.post("http://localhost:8000/api/upload", files=files)
-    file_data = response.json()
-    file_id = file_data["file_id"]
-    print(f"Uploaded file ID: {file_id}")
-
-# Analyze
-response = requests.post("http://localhost:8000/api/analyze", json={
-    "file_id": file_id,
-    "hazard_id": "flood_hazard_10_years_existing_climate",
-    "hazard_url": "https://hazards-data.unepgrid.ch/global_pc_h10glob.tif",
-    "intensity_threshold": 0.5
-})
-print(response.json())
-```
-
-## Project Structure
+## Structure
 
 ```
-backend/
-├── main.py                 # FastAPI application entry point
-├── app/
-│   ├── __init__.py
-│   ├── config.py          # Configuration settings
-│   ├── api/
-│   │   ├── __init__.py
-│   │   ├── upload.py      # File upload endpoints
-│   │   ├── hazards.py     # Hazard layer endpoints
-│   │   └── analyze.py     # Analysis endpoints
-│   └── utils/
-│       ├── __init__.py
-│       └── geospatial.py  # Geospatial utility functions
-├── requirements.txt       # Python dependencies
-└── README.md             # This file
+main.py                    # FastAPI app: routers, CORS, /health
+app/
+├── config.py              # Settings (paths, environment variables)
+├── api/
+│   ├── upload.py          # Uploads, held in memory; expiry and limits
+│   ├── hazards.py         # Hazard catalogue (data/hazard_layers.csv) and layer statistics
+│   ├── analyze.py         # Exposure and damage analysis; per-upload caches
+│   ├── tiles.py           # Hazard map tiles
+│   └── export.py          # PNG map and chart, CSV / GeoPackage data
+└── utils/
+    ├── geospatial.py      # Reading uploads, raster sampling, the analysis itself
+    └── export_data.py     # CSV and GeoPackage writers
+tests/
 ```
-
-## Notes
-
-- Uploaded files and analysis results are stored in memory with intelligent caching for fast threshold adjustments.
-- The tile server uses thread-local rasterio connections and tile caching for optimal performance.
-- CORS is configured to allow all origins for development. Update for production.
 
 ## Troubleshooting
 
-**Import errors with geospatial libraries:**
-- On macOS, you may need: `brew install gdal`
-- On Linux: `sudo apt-get install gdal-bin libgdal-dev`
-- On Windows: Use conda or pre-built wheels
-
-**Port already in use:**
-- Change the port in `app/config.py` or use `--port` flag with uvicorn
-
+- **Port already in use**: set `PORT` (for `python main.py`) or pass `--port` to uvicorn.
+- **No hazard layers listed**: the catalogue is missing or unreadable. On this branch it is
+  `data/hazard_layers.csv` here in `backend/`, with paths on the Posit server; for a local run, start the
+  backend with `HAZARD_LAYERS_CSV=../data/hazard_layers.csv` (the remote layers).
+- **"Could not read the hazard layer" (502)**: the server could not reach the raster host
+  (`hazards-data.unepgrid.ch` for the shipped catalogue); check outbound HTTPS and run the analysis again.

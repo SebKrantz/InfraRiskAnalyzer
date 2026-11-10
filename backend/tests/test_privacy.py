@@ -82,7 +82,7 @@ class UploadTest(unittest.TestCase):
                 for name, data in files.items():
                     with self.subTest(file=name):
                         r = self.client.post("/api/upload", files={"file": (name, data)})
-                        self.assertEqual(r.status_code, 500 if "broken" in name else 200)
+                        self.assertEqual(r.status_code, 400 if "broken" in name else 200)
                         if r.status_code == 200:
                             self.ids.append(r.json()["file_id"])
                         self.assertEqual(list(Path(tmp).iterdir()), [])

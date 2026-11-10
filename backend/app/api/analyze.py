@@ -5,6 +5,7 @@ Analysis endpoints for computing intersections
 import math
 import json
 import asyncio
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Tuple
 import numpy as np
 
-from app.utils.geospatial import analyze_intersection, parse_vulnerability_curve_data
+from app.utils.geospatial import analyze_intersection, parse_vulnerability_curve_data, HazardReadError
 from app.config import settings
 from app.api.upload import uploaded_files
 from app.api.hazards import load_hazards_dict
@@ -26,75 +27,82 @@ _analysis_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="analy
 # Both caches hold whole analyses — for a national line network that is a
 # segment GeoDataFrame plus every sample point along it, hundreds of MB per
 # entry. Dragging the threshold slider produces one analysis-result entry per
-# stop, so an unbounded dict grows without limit in a process that is meant to
-# stay up. Keep the most recent few and let the rest be recomputed; a raster
-# cache miss costs a re-sample, an analysis cache miss only costs arithmetic.
-_MAX_CACHE_ENTRIES = 8
+# stop, so an unbounded cache grows without limit in a process that is meant to
+# stay up. Each upload keeps its own few most recent entries: one cache shared
+# by every user let one person's slider push another's results out, and that
+# person's exports then failed. A cache miss costs a re-sample (raster values)
+# or only arithmetic (analysis results). An upload's entries go with it.
+_MAX_LAYERS_PER_UPLOAD = 4
+_MAX_RESULTS_PER_UPLOAD = 4
 
-# Cache for sampled raster values: (file_id, hazard_id) -> cached data
+# file_id -> hazard_id -> sampled raster values
 # For Points: np.ndarray of raster values
 # For LineStrings: dict with 'line_data' and 'raster_values'
 # This allows threshold changes without re-sampling the raster
-_raster_values_cache: "OrderedDict[Tuple[str, str], any]" = OrderedDict()
+_raster_values_cache: "Dict[str, OrderedDict]" = {}
 
-# Cache for full analysis results: (file_id, hazard_id, threshold) -> full analysis result
-# This allows export to use pre-computed results without recalculation
-_analysis_results_cache: "OrderedDict[Tuple[str, str, Optional[float]], dict]" = OrderedDict()
+# file_id -> (hazard_id, threshold) -> full analysis result, for the export endpoints
+_analysis_results_cache: "Dict[str, OrderedDict]" = {}
 
-
-def _cache_get(cache: OrderedDict, key) -> Optional[any]:
-    """Read through an LRU cache, marking the key as most recently used."""
-    if key not in cache:
-        return None
-    cache.move_to_end(key)
-    return cache[key]
+# The analysis handler writes these caches while the export workers read them
+_cache_lock = threading.Lock()
 
 
-def _cache_put(cache: OrderedDict, key, value) -> None:
-    """Write to an LRU cache, evicting the least recently used entry."""
-    cache[key] = value
-    cache.move_to_end(key)
-    while len(cache) > _MAX_CACHE_ENTRIES:
-        cache.popitem(last=False)
+def _cache_get(cache: Dict[str, OrderedDict], file_id: str, key) -> Optional[any]:
+    """Read through an upload's LRU cache, marking the key as most recently used."""
+    with _cache_lock:
+        entries = cache.get(file_id)
+        if entries is None or key not in entries:
+            return None
+        entries.move_to_end(key)
+        return entries[key]
+
+
+def _cache_put(cache: Dict[str, OrderedDict], file_id: str, key, value, limit: int) -> None:
+    """Write to an upload's LRU cache, evicting its least recently used entry."""
+    with _cache_lock:
+        entries = cache.setdefault(file_id, OrderedDict())
+        entries[key] = value
+        entries.move_to_end(key)
+        while len(entries) > limit:
+            entries.popitem(last=False)
 
 
 def get_cached_raster_values(file_id: str, hazard_id: str) -> Optional[any]:
     """Get cached raster values if available."""
-    return _cache_get(_raster_values_cache, (file_id, hazard_id))
+    return _cache_get(_raster_values_cache, file_id, hazard_id)
 
 
 def set_cached_raster_values(file_id: str, hazard_id: str, values: any):
     """Cache raster values for future threshold changes."""
-    _cache_put(_raster_values_cache, (file_id, hazard_id), values)
+    _cache_put(_raster_values_cache, file_id, hazard_id, values, _MAX_LAYERS_PER_UPLOAD)
 
 
 def clear_raster_cache_for_file(file_id: str):
-    """Clear cached raster values for a file (called when file is deleted)."""
-    keys_to_remove = [k for k in _raster_values_cache if k[0] == file_id]
-    for key in keys_to_remove:
-        del _raster_values_cache[key]
-    
-    # Also clear analysis results cache
-    keys_to_remove = [k for k in _analysis_results_cache if k[0] == file_id]
-    for key in keys_to_remove:
-        del _analysis_results_cache[key]
+    """Clear an upload's cached raster values and analysis results (when it is deleted)."""
+    with _cache_lock:
+        _raster_values_cache.pop(file_id, None)
+        _analysis_results_cache.pop(file_id, None)
 
 
 def get_cached_analysis_result(file_id: str, hazard_id: str, threshold: Optional[float]) -> Optional[dict]:
     """Get cached analysis result if available."""
-    return _cache_get(_analysis_results_cache, (file_id, hazard_id, threshold))
+    return _cache_get(_analysis_results_cache, file_id, (hazard_id, threshold))
 
 
 def set_cached_analysis_result(file_id: str, hazard_id: str, threshold: Optional[float], result: dict):
     """Cache full analysis result."""
-    _cache_put(_analysis_results_cache, (file_id, hazard_id, threshold), result)
+    _cache_put(
+        _analysis_results_cache, file_id, (hazard_id, threshold), result, _MAX_RESULTS_PER_UPLOAD
+    )
 
 
 class AnalyzeRequest(BaseModel):
     """Request model for analysis (JSON body)"""
     file_id: str
     hazard_id: str
-    hazard_url: str
+    # Accepted for older clients and ignored: the raster is the catalogue's, by hazard_id
+    hazard_url: Optional[str] = None
     intensity_threshold: Optional[float] = None
 
 
@@ -115,8 +123,8 @@ async def analyze_intersections(
     
     Parameters:
     - file_id: ID of uploaded infrastructure file
-    - hazard_id: ID of hazard layer
-    - hazard_url: URL/path to hazard raster (COG)
+    - hazard_id: ID of hazard layer (its raster is looked up in hazard_layers.csv)
+    - hazard_url: ignored; accepted so that older clients keep working
     - intensity_threshold: Optional threshold for hazard intensity filtering
     - vulnerability_curve_file: Optional CSV file with vulnerability curve (2 columns: intensity, proportion_destroyed)
     - replacement_value: Optional monetary replacement value (for lines, cost per meter)
@@ -132,11 +140,10 @@ async def analyze_intersections(
     # Handle both JSON and FormData requests
     if "multipart/form-data" in content_type:
         # FormData request (when vulnerability curve file is included)
-        if file_id is None or hazard_id is None or hazard_url is None:
-            raise HTTPException(status_code=400, detail="Missing required parameters: file_id, hazard_id, hazard_url")
+        if file_id is None or hazard_id is None:
+            raise HTTPException(status_code=400, detail="Missing required parameters: file_id, hazard_id")
         actual_file_id = file_id
         actual_hazard_id = hazard_id
-        actual_hazard_url = hazard_url
         actual_threshold = intensity_threshold
         actual_vulnerability_file = vulnerability_curve_file
         actual_replacement_value = replacement_value
@@ -151,7 +158,6 @@ async def analyze_intersections(
                 raise HTTPException(status_code=400, detail="Missing or invalid request body")
         actual_file_id = request.file_id
         actual_hazard_id = request.hazard_id
-        actual_hazard_url = request.hazard_url
         actual_threshold = request.intensity_threshold
         actual_vulnerability_file = None
         actual_replacement_value = None
@@ -167,6 +173,14 @@ async def analyze_intersections(
     file_info = uploaded_files[actual_file_id]
     geometry_type = file_info["geometry_type"]
     infrastructure_gdf = file_info["gdf"]
+
+    # The raster comes from the catalogue, never from the request: a client-supplied
+    # path or URL let a caller make the server open local files or fetch from hosts
+    # only it can reach, and cached its values under a real layer's id.
+    hazard_data = load_hazards_dict().get(actual_hazard_id)
+    if hazard_data is None or not hazard_data.get("dataset_url"):
+        raise HTTPException(status_code=404, detail=f"Hazard layer '{actual_hazard_id}' not found")
+    actual_hazard_url = hazard_data["dataset_url"]
     
     # Parse vulnerability curve if provided
     vulnerability_curve_interp = None
@@ -243,6 +257,12 @@ async def analyze_intersections(
             analysis_result["vulnerability_curve_intensity"] = vulnerability_curve_intensity
             analysis_result["vulnerability_curve_proportion"] = vulnerability_curve_proportion
             analysis_result["vulnerability_replacement_value"] = actual_replacement_value
+            # The split GPKG export re-applies the curves, bounds included
+            analysis_result["vulnerability_interps"] = (
+                vulnerability_curve_interp,
+                vulnerability_curve_lower_interp,
+                vulnerability_curve_upper_interp,
+            )
         
         # Cache raster values for future threshold changes
         if "raster_values" in analysis_result:
@@ -348,11 +368,16 @@ async def analyze_intersections(
             body = json.dumps(result, default=json_encoder, allow_nan=False)
 
         return Response(content=body, media_type="application/json")
-        
+
+    except HTTPException:
+        raise
+    except HazardReadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
+        print(f"Analysis failed: {type(e).__name__}: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error during analysis: {str(e)}"
+            detail=f"Error during analysis: {type(e).__name__}"
         )
 
 

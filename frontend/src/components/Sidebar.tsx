@@ -191,7 +191,6 @@ export default function Sidebar({
   useEffect(() => {
     if (thresholdEditing.current) return
     setThresholdInput(formatThreshold(intensityThreshold))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intensityThreshold])
 
   // Parse, clamp to the layer's range, and push. `normalize` is set by Enter
@@ -633,7 +632,9 @@ export default function Sidebar({
                             replacementValueEditing.current = true
                             setReplacementValueInput(e.target.value)
                           }}
-                          disabled={loadingUpload || loadingAnalysis}
+                          // Not disabled while an analysis runs: a pause in typing starts
+                          // one, and disabling the field then dropped the digits typed next
+                          disabled={loadingUpload}
                           placeholder="e.g. 100000"
                           className="border-0 bg-transparent px-0 py-0 h-auto text-gray-300 placeholder:text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
                         />
@@ -685,7 +686,8 @@ export default function Sidebar({
                       : 'Upload data and select a hazard to analyze'}
                 </div>
               ) : null}
-              {error && (
+              {/* Without a dataset the error is shown under the upload box instead */}
+              {error && uploadedFile && (
                 <p className="text-xs text-red-400 mt-2">{error}</p>
               )}
               

@@ -49,25 +49,12 @@ export async function getHazards(): Promise<Hazard[]> {
 }
 
 /**
- * Get specific hazard layer info
- */
-export async function getHazardInfo(hazardId: string): Promise<Hazard> {
-  const response = await fetch(`${API_BASE_URL}/hazards/${hazardId}`)
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch hazard layer info')
-  }
-
-  return response.json()
-}
-
-/**
- * Analyze intersections between infrastructure and hazard
+ * Analyze intersections between infrastructure and hazard. The server reads the
+ * hazard raster from its own catalogue, by hazardId.
  */
 export async function analyze(
   fileId: string,
   hazardId: string,
-  hazardUrl: string,
   intensityThreshold?: number,
   vulnerabilityCurveFile?: File | null,
   replacementValue?: number | null
@@ -82,7 +69,6 @@ export async function analyze(
     const formData = new FormData()
     formData.append('file_id', fileId)
     formData.append('hazard_id', hazardId)
-    formData.append('hazard_url', hazardUrl)
     if (intensityThreshold !== undefined) {
       formData.append('intensity_threshold', intensityThreshold.toString())
     }
@@ -96,7 +82,6 @@ export async function analyze(
     body = JSON.stringify({
       file_id: fileId,
       hazard_id: hazardId,
-      hazard_url: hazardUrl,
       intensity_threshold: intensityThreshold,
     })
     headers = {
@@ -113,19 +98,6 @@ export async function analyze(
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: 'Analysis failed' }))
     throw new Error(error.detail || 'Failed to perform analysis')
-  }
-
-  return response.json()
-}
-
-/**
- * Get upload info
- */
-export async function getUploadInfo(fileId: string): Promise<UploadedFile> {
-  const response = await fetch(`${API_BASE_URL}/upload/${fileId}`)
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch upload info')
   }
 
   return response.json()

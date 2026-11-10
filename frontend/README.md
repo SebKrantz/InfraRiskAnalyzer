@@ -1,89 +1,50 @@
-# Hazard-Infrastructure Analyzer - Frontend
+# Infrastructure Risk Analyzer — Frontend
 
-React + TypeScript frontend for the Hazard-Infrastructure Analyzer application.
+React 18 + TypeScript single-page app, built with Vite: the sidebar with the controls and results, the
+MapLibre map, and the bar chart. All data and analysis come from the backend; see the
+[root README](../README.md).
 
 ## Setup
 
-### Prerequisites
-
-- Node.js 18+ and npm/yarn/pnpm
-
-### Installation
-
-1. Install dependencies:
+Node.js 18 or newer to build (22 or 24 LTS recommended; `npm test` needs 22.18 or newer).
 
 ```bash
 npm install
-# or
-yarn install
-# or
-pnpm install
+npm run dev        # http://localhost:5173
 ```
 
-### Development
+The development server forwards `/api/*` to the backend at `http://localhost:8000`; set `BACKEND_URL` to use
+another address. It also reads `CARTO_API_KEY` from `../backend/.env` for the basemaps.
 
-Start the development server:
+## Scripts
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-```
+| Command | What it does |
+|---|---|
+| `npm run dev` | Development server with hot reload |
+| `npm run build` | Type check, then the production build in `dist/` |
+| `npm run preview` | Serve the production build locally |
+| `npm test` | Unit tests in `tests/` (Node's own test runner) |
+| `npm run lint` | ESLint, no warnings allowed |
 
-The app will be available at `http://localhost:5173`
+The production build leaves the placeholder `"__CARTO_API_KEY__"` in `dist/index.html`; write the key into it
+after every build (see the root README), or the default basemap shows a watermark.
 
-The frontend is configured to proxy API requests to `http://localhost:8000` (backend).
-
-## Features (Step 2)
-
-This is the Step 2 implementation with UI components and mock data. Features include:
-
-- ✅ Collapsible sidebar
-- ✅ File upload UI (mock for now)
-- ✅ Hazard selector
-- ✅ Info popup with metadata (80% opacity)
-- ✅ Color palette selector
-- ✅ Hazard intensity slider
-- ✅ Bar chart (Recharts)
-- ✅ Map with selectable basemaps
-- ✅ Placeholder overlays for data visualization
-
-## Project Structure
+## Structure
 
 ```
-frontend/
-├── src/
-│   ├── components/
-│   │   ├── ui/           # Reusable UI components (shadcn-style)
-│   │   ├── Sidebar.tsx   # Main sidebar component
-│   │   ├── MapView.tsx   # Map component
-│   │   └── BarChart.tsx  # Chart component
-│   ├── types/            # TypeScript type definitions
-│   ├── lib/              # Utility functions
-│   ├── App.tsx           # Main app component
-│   └── main.tsx          # Entry point
-├── package.json
-├── vite.config.ts
-└── tailwind.config.js
+src/
+├── App.tsx                # Top-level state; runs the analysis when an input changes
+├── components/
+│   ├── Sidebar.tsx        # Upload, layer, palette, threshold, vulnerability inputs, results, exports
+│   ├── MapView.tsx        # MapLibre map: basemaps, hazard tiles, asset layers, pop-ups
+│   ├── BarChart.tsx       # Results chart (Recharts)
+│   ├── DisclaimerDialog.tsx
+│   └── ui/                # Small shared components (button, input, select, slider, dialog)
+├── lib/
+│   ├── featurePopup.ts    # Map pop-up HTML; escapes everything that comes from the user's file
+│   └── utils.ts
+├── services/api.ts        # Calls to the backend
+└── types/index.ts
+public/                    # The user guide opened by the Guide button
+tests/
 ```
-
-## Next Steps (Step 3)
-
-- Connect to backend API
-- Implement actual file upload
-- Load real hazard layers
-- Perform analysis and visualize results
-- Add loading and error states
-
-## Build
-
-To build for production:
-
-```bash
-npm run build
-```
-
-The built files will be in the `dist` directory.
-

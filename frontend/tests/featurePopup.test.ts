@@ -1,6 +1,7 @@
 // The map pop-up escapes everything that comes from the user's file (src/lib/featurePopup.ts).
-// No test runner in this repo: Node runs it directly (type stripping), from frontend/:
-//   node --test tests/*.test.ts
+// No test runner in this repo: Node runs it directly (type stripping, Node 22.18 or
+// newer), from frontend/:
+//   npm test
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 

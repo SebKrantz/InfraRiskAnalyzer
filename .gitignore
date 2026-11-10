@@ -5,6 +5,13 @@
 venv/
 /workflow.md
 
+# API keys (CARTO_API_KEY) live here, never in git
+backend/.env
+.env
+
+__pycache__/
+*.pyc
+
 # Hazard rasters (too large for git) and generated catalog backup
 /data/rasters/
 /data/hazard_layers.remote.csv

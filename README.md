@@ -1,262 +1,222 @@
 # Infrastructure Risk Analyzer
 
-A high-performance web application for analyzing infrastructure assets against hazard layers. Upload spatial datasets (Shapefile, GeoPackage, or CSV) representing infrastructure and visualize their exposure to various hazard risks with interactive maps and statistics.
+A web application for screening infrastructure assets against natural-hazard layers. Upload a
+dataset of points (towers, substations, data centers) or lines (fibre, roads, pipelines), pick
+a hazard layer, set an intensity threshold, and see which assets are exposed on an interactive
+map, with a bar chart of the counts or lengths. With a vulnerability curve and a replacement
+value the app also estimates the damage cost, with a low–high range when the curve carries
+bounds.
+
+The 29 hazard layers in the shipped catalogue are the GIRI global layers (floods, tropical
+cyclone wind, landslides, earthquakes, drought, plus building exposure and population), read
+as Cloud Optimized GeoTIFFs from the UNEP/GRID server.
+
+**This is the `posit` branch**: the same app packaged for Posit Connect, where FastAPI also serves the
+built frontend (`backend/static/`) and the hazard catalogue points at rasters on the Posit server. Make
+changes on `main` and merge them in here; see [Production on Posit Connect](#production-on-posit-connect-this-branch).
 
 ## Features
 
-- **Multi-format Support**: Upload infrastructure data as Shapefiles, GeoPackages, or CSV files with coordinates
-- **Hazard Layer Analysis**: Analyze infrastructure against multiple hazard layers (floods, earthquakes, etc.)
-- **Interactive Visualization**: 
-  - Dynamic map with multiple basemap options
-  - Color-coded hazard layers with adjustable opacity
-  - Real-time affected/unaffected infrastructure visualization
-- **Customizable Analysis**:
-  - Adjustable hazard intensity thresholds
-  - Multiple color palettes for hazard visualization
-  - Layer visibility controls
-- **Statistical Summary**: Bar charts showing affected vs. unaffected infrastructure counts or lengths
-- **User-Friendly Interface**: Collapsible sidebar with info tooltips and responsive design
+- **Upload formats**: zipped Shapefile, GeoPackage, GeoJSON, or CSV with coordinate columns or a WKT column
+- **Hazard layers**: 29 GIRI layers in `data/hazard_layers.csv`, each with its unit, description and source paper
+- **Exposure analysis**: an asset is affected when the hazard intensity at it is at or above the threshold
+  (above 0 with no threshold); lines are sampled at every vertex and at most 100 m apart and split into
+  affected and unaffected stretches
+- **Damage analysis**: a vulnerability curve (intensity → damage ratio, optionally with lower and upper
+  bounds) times a replacement value per asset (points) or per metre (lines), over the affected assets
+- **Map**: nine basemaps, hazard colour palettes and opacity, layer toggles, a pop-up with each asset's values
+- **Exports**: map and bar chart as high-resolution PNG, results as CSV, and line results split into
+  segments as GeoPackage
 
-## Tech Stack
+## Tech stack
 
-### Backend
-- **FastAPI** - Modern Python web framework
-- **Geospatial Libraries**: `geopandas`, `xarray`, `rasterio`, `pyogrio`, `pandas`
-- **Cloud Optimized GeoTIFF (COG)** support for efficient raster processing
+- **Backend**: FastAPI and Uvicorn; geopandas and pyogrio (vector I/O), rasterio (raster I/O),
+  pandas and numpy; matplotlib, seaborn and contextily (tiles and exports)
+- **Frontend**: React 18 and TypeScript, built with Vite; MapLibre GL (map), Recharts (chart),
+  TailwindCSS
 
-### Frontend
-- **React** + **TypeScript** - Component-based UI
-- **Vite** - Fast build tool and dev server
-- **MapLibre GL** - High-performance map rendering
-- **Recharts** - Data visualization
-- **TailwindCSS** + **shadcn/ui** - Modern styling and UI components
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- **Backend**: Python 3.10 or higher
-- **Frontend**: Node.js 18+ and npm
-
-### Backend Setup
-
-1. Navigate to the backend directory:
-```bash
-cd backend
-```
-
-2. Create and activate a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Create data directory and configure hazard layers:
-```bash
-mkdir -p data
-```
-
-Create `data/hazard_layers.csv` with semicolon-delimited format:
-```csv
-hazard;dataset_url;description;background_paper
-Flood Hazard 10 Years;https://example.com/flood.tif;Description;Paper URL
-```
-
-5. Start the backend server:
-```bash
-python main.py
-# Or: uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-
-The API will be available at `http://localhost:8000`
-
-### Frontend Setup
-
-1. Navigate to the frontend directory:
-```bash
-cd frontend
-```
-
-2. Install dependencies:
-```bash
-npm install
-```
-
-3. Start the development server:
-```bash
-npm run dev
-```
-
-The application will be available at `http://localhost:5173`
-
-## Usage
-
-1. **Upload Infrastructure Data**: 
-   - Click "Upload Infrastructure Data" and select a Shapefile (zipped), GeoPackage, or CSV file
-   - CSV files should contain coordinate columns (`lat`/`lon`, `latitude`/`longitude`, or `y`/`x`)
-
-2. **Select Hazard Layer**: 
-   - Choose a hazard layer from the dropdown
-   - Click the info icon (ℹ️) to view metadata and background papers
-
-3. **Customize Visualization**:
-   - Select a color palette for the hazard layer
-   - Adjust opacity (0-100%)
-   - Set hazard intensity threshold using the slider
-
-4. **View Results**:
-   - The map shows affected (red) and unaffected (green) infrastructure
-   - The bar chart displays summary statistics
-   - Toggle layer visibility using the layer control panel
-
-## Project Structure
+- **Backend**: Python 3.10 or newer (3.11 recommended)
+- **Frontend**: Node.js 18 or newer to build (22 or 24 LTS recommended; the frontend tests need 22.18 or newer)
 
 ### Backend
 
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env              # then set CARTO_API_KEY in it, see Configuration
+HAZARD_LAYERS_CSV=../data/hazard_layers.csv python main.py   # the remote layers, see below
 ```
-backend/
-├── main.py                # FastAPI application entry point
-├── app/
-│   ├── config.py          # Configuration & paths
-│   ├── api/
-│   │   ├── upload.py      # File upload endpoints
-│   │   ├── hazards.py     # Hazard layer endpoints
-│   │   ├── analyze.py     # Analysis endpoints
-│   │   └── tiles.py       # Tile serving endpoints
-│   └── utils/
-│       └── geospatial.py  # Geospatial utilities
-├── requirements.txt       # Dependencies
-└── README.md              # Backend setup instructions
-```
+
+The API runs at `http://localhost:8000`, with interactive documentation at `http://localhost:8000/docs`.
+
+The backend reads `backend/data/hazard_layers.csv`, the catalogue deployed to Posit Connect, whose paths
+point at the rasters on the Posit server (`/Data/shinydata/infrarisk/`). On any other machine, use the
+repository's catalogue `data/hazard_layers.csv`, which lists the same 29 layers as remote URLs, by setting
+`HAZARD_LAYERS_CSV` as above. `python scripts/download_hazard_rasters.py` (from the repository root)
+downloads every layer into `data/rasters/` and rewrites that catalogue to point at them.
 
 ### Frontend
 
+```bash
+cd frontend
+npm install
+npm run dev
 ```
+
+The app runs at `http://localhost:5173`. The development server sends `/api/*` requests to the backend at
+`http://localhost:8000`; set `BACKEND_URL` to use another address
+(`BACKEND_URL=http://127.0.0.1:8123 npm run dev`).
+
+## Using the app
+
+1. **Upload** a dataset under *Upload Infrastructure Data*. CSV files need longitude/latitude columns
+   (`lon`/`lat`, `lng`/`lat`, `longitude`/`latitude` or `x`/`y`) or a WKT column (`geometry`, `geom` or `wkt`).
+2. **Select a hazard layer**. The ⓘ buttons explain each control and layer.
+3. **Set the threshold**: type a value or drag the slider. A new layer starts at its minimum, which counts
+   every asset the hazard reaches; the threshold carries over when you switch to another layer in the same
+   unit (another return period or scenario).
+4. **Damage (optional)**: tick *Vulnerability Analysis*, load a curve CSV (two columns, intensity and damage
+   ratio, or four: intensity, lower, central, upper) and enter the replacement value: per asset for points,
+   per metre for lines.
+5. **Export** with the *Map*, *Barchart* and *Data* buttons under the chart.
+
+Results update by themselves a moment after any change. The user guide (`docs/infra-risk-analyzer-guide.pdf`,
+also behind the *Guide* button) walks through a full analysis.
+
+## Project structure
+
+```
+backend/
+├── main.py                    # FastAPI app: routers, CORS, /health
+├── app/
+│   ├── config.py              # Settings (paths, environment variables)
+│   ├── api/
+│   │   ├── upload.py          # Uploads, held in memory; expiry
+│   │   ├── hazards.py         # Hazard catalogue and layer statistics
+│   │   ├── analyze.py         # Exposure and damage analysis; per-upload caches
+│   │   ├── tiles.py           # Hazard map tiles rendered from the rasters
+│   │   └── export.py          # PNG map and chart, CSV / GeoPackage data
+│   └── utils/
+│       ├── geospatial.py      # Reading uploads, raster sampling, the analysis itself
+│       └── export_data.py     # CSV and GeoPackage writers
+├── tests/                     # python -m pytest
+├── requirements.txt
+└── requirements-dev.txt       # requirements.txt plus the test tools
 frontend/
-├── index.html             # HTML entry point
-├── package.json           # NPM dependencies & scripts
-├── vite.config.ts         # Vite configuration
-├── tsconfig.json          # TypeScript configuration
-├── tailwind.config.js     # TailwindCSS configuration
-├── postcss.config.js      # PostCSS configuration
-├── README.md              # Frontend setup instructions
-└── src/
-    ├── main.tsx           # React entry point
-    ├── App.tsx            # Main app component
-    ├── index.css          # Global styles
-    ├── vite-env.d.ts      # Vite type definitions
-    ├── components/
-    │   ├── ui/            # Reusable UI components
-    │   │   ├── button.tsx
-    │   │   ├── input.tsx
-    │   │   ├── select.tsx
-    │   │   ├── slider.tsx
-    │   │   ├── card.tsx
-    │   │   └── dialog.tsx
-    │   ├── Sidebar.tsx    # Collapsible sidebar with controls
-    │   ├── MapView.tsx    # Map component with basemap selector
-    │   └── BarChart.tsx   # Chart component (Recharts)
-    ├── types/
-    │   └── index.ts       # TypeScript type definitions
-    ├── services/
-    │   └── api.ts         # API service functions
-    └── lib/
-        └── utils.ts       # Utility functions
+├── index.html
+├── public/                    # The user guide opened by the Guide button
+├── src/
+│   ├── App.tsx                # Top-level state and the analysis requests
+│   ├── components/
+│   │   ├── Sidebar.tsx        # Controls, results and export buttons
+│   │   ├── MapView.tsx        # MapLibre map, basemaps, hazard and asset layers
+│   │   ├── BarChart.tsx       # Results chart
+│   │   ├── DisclaimerDialog.tsx
+│   │   └── ui/                # Small shared components
+│   ├── lib/                   # Pop-up builder (escapes all user data), helpers
+│   ├── services/api.ts        # Calls to the backend
+│   └── types/index.ts
+└── tests/                     # npm test
+data/hazard_layers.csv         # The hazard catalogue with remote URLs (semicolon-separated)
+backend/data/hazard_layers.csv # The same layers at their paths on the Posit server
+backend/static/                # The built frontend served on Posit Connect (npm run build:connect)
+backend/manifest.json          # rsconnect manifest; Python 3.11.9 (also .python-version)
+scripts/download_hazard_rasters.py
+docs/                          # Technical guide and user guide, Word and PDF
 ```
 
-## API Endpoints
+## API
 
-### Upload
-- `POST /api/upload` - Upload spatial file (Shapefile, GeoPackage, or CSV)
+All endpoints except `/health` start with `/api`; see `http://localhost:8000/docs` for the full reference.
 
-### Hazards
-- `GET /api/hazards` - List available hazard layers
-- `GET /api/hazards/{hazard_id}` - Get hazard layer details
-- `GET /api/hazards/{hazard_id}/stats` - Get hazard statistics (min, max, mean)
-
-### Analysis
-- `POST /api/analyze` - Perform spatial intersection analysis
-
-### Tiles
-- `GET /api/tiles/{hazard_id}/{z}/{x}/{y}.png` - Get hazard layer tiles
-
-For detailed API documentation, visit `http://localhost:8000/docs` when the backend is running.
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/api/upload` | Upload a dataset (multipart field `file`); returns a `file_id`, metadata and the data as GeoJSON |
+| GET | `/api/upload/{file_id}` | Metadata of an upload |
+| DELETE | `/api/upload/{file_id}` | Delete an upload and its cached results |
+| GET | `/api/hazards` | The hazard layers |
+| GET | `/api/hazards/{hazard_id}` | One hazard layer |
+| GET | `/api/hazards/{hazard_id}/stats` | A layer's minimum and maximum |
+| POST | `/api/analyze` | Exposure analysis (JSON: `file_id`, `hazard_id`, optional `intensity_threshold`), or exposure and damage (multipart, adding `vulnerability_curve_file` and `replacement_value`). The raster is the catalogue's for `hazard_id` |
+| GET | `/api/analyze/{file_id}/status` | Whether an upload is loaded |
+| GET | `/api/tiles/{hazard_id}/{z}/{x}/{y}.png` | Map tile of a hazard layer |
+| POST | `/api/export/barchart`, `/api/export/map` | PNG chart or map of the last analysis |
+| POST | `/api/export/data` | CSV (`csv_points`, `csv_lines_aggregate`) or GeoPackage (`gpkg_lines_split`) of the last analysis |
+| GET | `/health` | Health check |
 
 ## Configuration
 
-### Backend Environment Variables
+The backend reads these environment variables, or `backend/.env` (copy `backend/.env.example`); a variable
+set in the environment wins over the file.
 
-- `HOST`: Server host (default: `0.0.0.0`)
-- `PORT`: Server port (default: `8000`)
-- `DEBUG`: Debug mode (default: `False`)
-- `UPLOAD_DIR`: Upload directory (default: `backend/uploads`)
-- `DATA_DIR`: Data directory (default: `backend/data`)
+| Variable | Default | Meaning |
+|---|---|---|
+| `CARTO_API_KEY` | (empty) | Key for the CARTO basemaps (Positron, the default, and Dark Matter). Without it they show an "API KEY REQUIRED" watermark |
+| `UPLOAD_TTL_HOURS` | `4` | Hours an upload may go unused before it is deleted, with its cached results |
+| `MAX_UPLOAD_MB` | `100` | Largest upload accepted; a zipped shapefile may unpack to at most ten times this |
+| `MAX_UPLOADS` | `100` | Uploads held in memory at once; past this the least recently used is dropped |
+| `CORS_ORIGINS` | (empty) | Comma-separated origins of other sites allowed to call the API from a browser |
+| `HAZARD_LAYERS_CSV` | `backend/data/hazard_layers.csv` | Path of the hazard catalogue; overrides `DATA_DIR` |
+| `DATA_DIR` | `backend/data` | Directory of the catalogue (and local rasters) |
+| `HOST`, `PORT`, `DEBUG` | `0.0.0.0`, `8000`, `False` | Used by `python main.py` only (`DEBUG=true` turns on auto-reload); with `uvicorn`, pass `--host` and `--port` |
 
-### Data Format
+**Hazard catalogue**: semicolon-separated, with the columns `hazard` (display name)
+and `dataset_url` (URL or path of a Cloud Optimized GeoTIFF in WGS84), and optionally `description`,
+`background_paper`, `unit` and `category`. The layer ID used in the API is derived from the name.
 
-**Hazard Layers CSV** (`data/hazard_layers.csv`):
-- Delimiter: semicolon (`;`)
-- Required columns: `hazard`, `dataset_url`
-- Optional columns: `description`, `background_paper`
+## Tests
 
-**Infrastructure Upload Formats**:
-- Shapefile: Zipped with `.shp`, `.shx`, `.dbf` (and optionally `.prj`)
-- GeoPackage: Single `.gpkg` file
-- CSV: Must contain coordinate columns (see usage section)
-
-## Development
-
-### Backend Development
-
-Run with auto-reload:
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+cd backend
+pip install -r requirements-dev.txt
+python -m pytest                  # or: python -m unittest discover -s tests
+
+cd ../frontend
+npm test                          # Node 22.18 or newer
+npm run lint
 ```
 
-### Frontend Development
+## Production on Posit Connect (this branch)
 
-The Vite dev server includes hot module replacement (HMR) for instant updates.
+On this branch FastAPI serves the built frontend from `backend/static/` (committed), fills in the CARTO key
+when it serves the page, and compresses JSON responses. Only the Python app is deployed; Connect runs
+Python 3.11.9 (pinned in `backend/manifest.json` and `.python-version`).
 
-### Building for Production
+1. After any frontend change, rebuild the frontend into `backend/static/` and commit it:
 
-**Frontend**:
+   ```bash
+   cd frontend
+   npm run build:connect
+   ```
+
+2. Deploy from the repository root:
+
+   ```bash
+   rsconnect deploy fastapi -n <saved-server-name> --entrypoint main:app --exclude .env backend/
+   ```
+
+3. On Connect, set `CARTO_API_KEY` (and `HAZARD_LAYERS_CSV` if the catalogue is not in the bundle) under the
+   content's Vars, and set *Max processes* to 1: uploads and results live in the memory of one process.
+
+The catalogue in the bundle, `backend/data/hazard_layers.csv`, points at the rasters on the Posit server
+(`/Data/shinydata/infrarisk/`). For a local run of this branch, use the repository's catalogue with the
+remote layers instead:
+
 ```bash
-cd frontend
-npm run build
+cd backend
+HAZARD_LAYERS_CSV=../data/hazard_layers.csv python main.py
 ```
 
-**Backend**:
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-```
-
-> **Note**: Use `--workers 1` as the application uses in-memory state for uploaded files and analysis caching. Multi-worker deployment would require Redis or similar for shared state.  
-
-### Posit Connect Deployment
-
-Posit Connect supports FastAPI applications and can serve the built React assets from the same app.
-
-1. Build the frontend for Connect (outputs to `backend/static`):
-```bash
-cd frontend
-npm run build:connect
-```
-
-2. Deploy the FastAPI app from the repo root:
-```bash
-rsconnect deploy fastapi -n <saved-server-name> --entrypoint main:app --exclude .env backend/
-```
-
-Notes:
-- Set `CARTO_API_KEY` under the content's Vars on Connect. For a local run, copy `backend/.env.example` to `backend/.env`; `--exclude .env` keeps that file out of the bundle.
-- Ensure `data/hazard_layers.csv` is present on the server or included in the bundle.
-- Keep `--workers 1` in production unless you add a shared cache (e.g., Redis).
-- See the Posit Connect FastAPI docs for entrypoint details.
+`--exclude .env` keeps a local `backend/.env` out of the bundle. To deploy from a manifest (or from Git),
+regenerate it first: `rsconnect write-manifest fastapi --overwrite --entrypoint main:app --exclude .env
+--exclude "**/__pycache__/**" backend/`. The technical guide (`docs/`) covers the Connect settings, raster
+permissions and troubleshooting.
 
 ## Documentation
 

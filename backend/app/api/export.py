@@ -2,7 +2,9 @@
 Export endpoints for generating high-resolution images
 """
 import io
+import re
 import asyncio
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
@@ -20,7 +22,7 @@ from app.config import settings
 from app.api.upload import uploaded_files
 from app.api.hazards import load_hazards_dict
 from app.api.analyze import get_cached_raster_values, get_cached_analysis_result
-from app.utils.geospatial import analyze_intersection, mask_raster_nodata, vulnerability_interp_from_arrays
+from app.utils.geospatial import analyze_intersection, mask_raster_nodata
 from app.utils.export_data import (
     lines_aggregate_to_csv_bytes,
     lines_split_to_gpkg_bytes,
@@ -107,9 +109,9 @@ def _run_data_export(
     if mode in ("csv_lines_aggregate", "gpkg_lines_split") and geometry_type != "LineString":
         raise ValueError("MODE_GEOMETRY_MISMATCH")
 
+    # The result at this exact threshold: falling back to the one without a
+    # threshold exported other numbers than the screen showed
     cached_analysis = get_cached_analysis_result(file_id, hazard_id, intensity_threshold)
-    if cached_analysis is None:
-        cached_analysis = get_cached_analysis_result(file_id, hazard_id, None)
     if cached_analysis is None:
         raise ValueError("NO_ANALYSIS_CACHE")
 
@@ -134,16 +136,11 @@ def _run_data_export(
         line_data = cached_analysis.get("line_data")
         if line_data is None:
             line_data = []
-        vi = cached_analysis.get("vulnerability_curve_intensity")
-        vp = cached_analysis.get("vulnerability_curve_proportion")
         repl = cached_analysis.get("vulnerability_replacement_value")
-        interp = None
-        if vi is not None and vp is not None and len(vi) > 0 and len(vp) > 0:
-            interp = vulnerability_interp_from_arrays(
-                np.asarray(vi, dtype=np.float64),
-                np.asarray(vp, dtype=np.float64),
-            )
-        body = lines_split_to_gpkg_bytes(line_data, interp, repl)
+        interp, lower, upper = cached_analysis.get("vulnerability_interps", (None, None, None))
+        body = lines_split_to_gpkg_bytes(
+            line_data, intensity_threshold, interp, repl, lower, upper
+        )
         return body, f"lines_split_{short_f}_{short_h}.gpkg", "application/geopackage+sqlite3"
 
     raise ValueError("INVALID_MODE")
@@ -197,6 +194,31 @@ def _threshold_labels(
         t = f'{intensity_threshold:g}'
         return f'Affected (\u2265 {t}){suffix}', f'Unaffected (< {t}){suffix}'
     return f'Affected (> 0){suffix}', f'Unaffected (= 0){suffix}'
+
+
+def tex_safe(text) -> str:
+    """Escape `$` so matplotlib prints it: two of them in one string switch on
+    mathtext and garble everything between ("$15,166,246 - $45,498,737")."""
+    return re.sub(r'(?<!\\)\$', r'\\$', str(text))
+
+
+def _musd(value: float, like: Optional[float] = None) -> str:
+    """US$ millions with thousands separators and just enough decimals to read
+    (those of `like`, when given, so a range reads at one precision)."""
+    m = value / 1e6
+    ref = abs((like if like else value) / 1e6)
+    if m == 0:
+        return '0'
+    decimals = 0 if ref >= 100 else 1 if ref >= 10 else 2 if ref >= 0.1 else 3
+    return f'{m:,.{decimals}f}'
+
+
+def _damage_label(damage: float, lower: Optional[float] = None, upper: Optional[float] = None) -> str:
+    """'US$ 15.2 m', and the uncertainty range beneath it when there is one."""
+    label = f'US$ {_musd(damage)} m'
+    if lower is not None and upper is not None:
+        label += f'\n[US$ {_musd(lower, damage)} - {_musd(upper, damage)} m]'
+    return tex_safe(label)
 
 
 def generate_barchart_png(
@@ -280,68 +302,61 @@ def generate_barchart_png(
                         if length_sum > 0:
                             vulnerability_pct = (weighted_sum / length_sum) * 100
 
-        # Create dual-axis plot
-        fig, ax1 = plt.subplots(figsize=(6, 5))
-
-        # Disable gridlines
+        # Two panels rather than a twin axis: money on the left, the two shares
+        # on the right, each on a scale of its own
+        fig, (ax1, ax2) = plt.subplots(
+            1, 2, figsize=(7, 5), gridspec_kw={'width_ratios': [1.2, 2.2]}
+        )
         ax1.grid(False)
-
-        # Left axis: damage cost
-        categories = ['Damage Cost', 'Exposure', 'Damage Ratio']
-        x_pos = np.arange(len(categories))
+        ax2.grid(False)
         width = 0.6
 
-        # Plot damage cost on left axis
-        bars1 = ax1.bar(x_pos[0], damage_cost, width, color='#f59e0b', alpha=0.8, zorder=3)
-        ax1.set_ylabel('Damage Cost (USD)', fontsize=12, color='#4b5563')
+        # Left panel: damage cost in US$ million
+        cost_m = damage_cost / 1e6
+        ax1.bar(0, cost_m, width, color='#f59e0b', alpha=0.8, zorder=3)
+        ax1.set_ylabel(tex_safe('Damage cost (US$ million)'), fontsize=12, color='#4b5563')
         ax1.tick_params(axis='y', labelcolor='#4b5563')
-        ax1.set_xticks(x_pos)
-        ax1.set_xticklabels(['Damage', 'Exposure', 'Damage Ratio'], fontsize=11, color='#4b5563')
-        ax1.set_title(title, fontsize=14, fontweight='bold')
+        ax1.set_xticks([0])
+        ax1.set_xticklabels(['Damage'], fontsize=11, color='#4b5563')
+        ax1.set_xlim(-0.6, 0.6)
+        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.10g}'))
 
         # Y-axis upper limit — extend to accommodate error bar whisker when bounds present
-        y_top_ref = damage_upper if has_bounds else damage_cost
-        ax1.set_ylim(bottom=0, top=max(y_top_ref, 1) * 1.25)
-
-        # Format left axis as currency
-        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+        y_top_ref = (damage_upper if has_bounds else damage_cost) / 1e6
+        y_top = max(y_top_ref, 0.1) * 1.25
+        ax1.set_ylim(bottom=0, top=y_top)
 
         # Error bars for damage cost uncertainty bounds
         if has_bounds:
             ax1.errorbar(
-                x_pos[0], damage_cost,
-                yerr=[[damage_cost - damage_lower], [damage_upper - damage_cost]],
+                0, cost_m,
+                yerr=[[cost_m - damage_lower / 1e6], [damage_upper / 1e6 - cost_m]],
                 fmt='none', color='#374151', capsize=10, capthick=2,
                 linewidth=2, zorder=4,
             )
+        ax1.text(
+            0, y_top_ref + y_top * 0.02,
+            _damage_label(damage_cost, damage_lower if has_bounds else None,
+                          damage_upper if has_bounds else None),
+            ha='center', va='bottom', fontsize=9, color='#f59e0b',
+        )
 
-        # Right axis: percentages
-        ax2 = ax1.twinx()
-        ax2.grid(False)  # Disable gridlines on right axis too
-        bars2 = ax2.bar(x_pos[1], exposure_pct, width, color='#3b82f6', alpha=0.8)
-        bars3 = ax2.bar(x_pos[2], vulnerability_pct, width, color='#10b981', alpha=0.8)
+        # Right panel: exposure and damage ratio, in percent
+        ax2.bar(0, exposure_pct, width, color='#3b82f6', alpha=0.8)
+        ax2.bar(1, vulnerability_pct, width, color='#10b981', alpha=0.8)
         ax2.set_ylabel('Percentage (%)', fontsize=12, color='#4b5563')
         ax2.tick_params(axis='y', labelcolor='#4b5563')
+        ax2.set_xticks([0, 1])
+        ax2.set_xticklabels(['Exposure', 'Damage ratio'], fontsize=11, color='#4b5563')
+        ax2.set_xlim(-0.6, 1.6)
         ax2.set_ylim(0, 100)
+        ax2.text(0, exposure_pct + 1, f'{exposure_pct:.1f}%',
+                 ha='center', va='bottom', fontsize=10, color='#3b82f6')
+        ax2.text(1, vulnerability_pct + 1, f'{vulnerability_pct:.1f}%',
+                 ha='center', va='bottom', fontsize=10, color='#10b981')
 
-        # Add value labels on bars
-        # Damage cost — show range below the central value when bounds present
-        label_y = damage_upper if has_bounds else damage_cost
-        cost_label = f'${damage_cost:,.0f}'
-        if has_bounds:
-            cost_label += f'\n[${damage_lower:,.0f} - ${damage_upper:,.0f}]'
-        ax1.text(
-            x_pos[0], label_y + max(y_top_ref, 1) * 0.02,
-            cost_label, ha='center', va='bottom', fontsize=9, color='#f59e0b',
-        )
-        # Exposure
-        ax2.text(x_pos[1], exposure_pct + 1,
-                f'{exposure_pct:.1f}%', ha='center', va='bottom', fontsize=10, color='#3b82f6')
-        # Damage Ratio
-        ax2.text(x_pos[2], vulnerability_pct + 1,
-                f'{vulnerability_pct:.1f}%', ha='center', va='bottom', fontsize=10, color='#10b981')
-
-        plt.tight_layout()
+        fig.suptitle(tex_safe(textwrap.fill(title, 56)), fontsize=14, fontweight='bold')
+        fig.tight_layout()
 
         # Save to bytes buffer
         img_buffer = io.BytesIO()
@@ -356,9 +371,10 @@ def generate_barchart_png(
             unaffected = analysis_result.get('unaffected_count', 0)
             ylabel = 'Count'
         else:
-            affected = analysis_result.get('affected_meters', 0)
-            unaffected = analysis_result.get('unaffected_meters', 0)
-            ylabel = 'Length (meters)'
+            # km, as the on-screen chart: one unit for a length across the figures
+            affected = analysis_result.get('affected_meters', 0) / 1000
+            unaffected = analysis_result.get('unaffected_meters', 0) / 1000
+            ylabel = 'Length (km)'
         
         affected_label, unaffected_label = _threshold_labels(
             intensity_threshold, hazard_unit
@@ -376,7 +392,7 @@ def generate_barchart_png(
                     palette=palette, ax=ax)
         ax.set_ylabel(ylabel, fontsize=12)
         ax.set_xlabel('', fontsize=12)
-        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_title(tex_safe(title), fontsize=14, fontweight='bold')
         
         # Add value labels on bars
         max_value = max(plot_data['Value'])
@@ -385,7 +401,7 @@ def generate_barchart_png(
         ax.set_ylim(bottom=0, top=max_value * 1.15)
         
         for i, v in enumerate(plot_data['Value']):
-            label = f'{v:,.0f}'
+            label = f'{v:,.0f}' if geometry_type == 'Point' else f'{v:,.1f}' if v >= 10 else f'{v:,.2f}'
             ax.text(i, v + max_value * 0.01, 
                     label, ha='center', va='bottom', fontsize=11)
         
@@ -611,25 +627,12 @@ def generate_map_png(
                               interpolation='bilinear', 
                               aspect='auto', origin='upper', zorder=1)
                 
-                # Create a ScalarMappable for the colorbar
-                # We need to create a normalization that matches our sqrt transformation
-                from matplotlib.colors import Normalize
+                # Create a ScalarMappable for the colorbar. FuncNorm carries a true
+                # inverse, so the bar's ticks stay inside [vmin, vmax] on the sqrt
+                # scale the raster is drawn with (a hand-rolled Normalize without
+                # one drew ticks past both ends, which overprinted the end labels).
+                from matplotlib.colors import FuncNorm, Normalize
                 from matplotlib.cm import ScalarMappable
-                
-                # Create a custom normalization class for sqrt scaling
-                class SqrtNormalize(Normalize):
-                    def __init__(self, vmin=None, vmax=None, clip=False):
-                        super().__init__(vmin, vmax, clip)
-                    
-                    def __call__(self, value, clip=None):
-                        # Apply sqrt normalization
-                        result = np.ma.masked_array(value, mask=np.ma.getmask(value))
-                        if self.vmin is not None and self.vmax is not None and self.vmax > self.vmin:
-                            sqrt_vmin = np.sqrt(self.vmin)
-                            sqrt_vmax = np.sqrt(self.vmax)
-                            result = (np.sqrt(result) - sqrt_vmin) / (sqrt_vmax - sqrt_vmin)
-                            result = np.clip(result, 0, 1)
-                        return result
                 
                 # Create ScalarMappable for colorbar with blue colormap
                 from matplotlib.colors import LinearSegmentedColormap
@@ -637,7 +640,8 @@ def generate_map_png(
                 blue_colors = ['#dbeafe', '#1e40af']  # Light blue to dark blue
                 blue_cmap = LinearSegmentedColormap.from_list('blue_hazard', blue_colors, N=256)
                 
-                norm = SqrtNormalize(vmin=vmin, vmax=vmax)
+                norm = (FuncNorm((np.sqrt, np.square), vmin=vmin, vmax=vmax) if vmax > vmin
+                        else Normalize(vmin=vmin, vmax=vmax))  # a constant window has no scale
                 sm = ScalarMappable(norm=norm, cmap=blue_cmap)
                 sm.set_array([])
                 
@@ -799,22 +803,15 @@ async def export_barchart(request: ExportBarchartRequest):
         raise HTTPException(status_code=500, detail="Hazard layer missing dataset_url")
     
     try:
-        # Since button only appears after analysis completes, we should always have a cached result
-        # Try to find cached result (check with provided threshold first, then try None)
+        # The export buttons appear once the analysis is done, so the result at this
+        # exact threshold is cached; falling back to the one without a threshold
+        # exported other numbers than the screen showed
         cached_analysis = get_cached_analysis_result(
-            request.file_id, 
-            request.hazard_id, 
+            request.file_id,
+            request.hazard_id,
             request.intensity_threshold
         )
-        
-        # If not found with threshold, try without threshold (for cases where threshold wasn't used)
-        if cached_analysis is None:
-            cached_analysis = get_cached_analysis_result(
-                request.file_id, 
-                request.hazard_id, 
-                None
-            )
-        
+
         if cached_analysis is None:
             raise HTTPException(
                 status_code=404,
@@ -870,7 +867,10 @@ async def export_barchart(request: ExportBarchartRequest):
             media_type="image/png",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-        
+
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -903,22 +903,15 @@ async def export_map(request: ExportMapRequest):
         raise HTTPException(status_code=500, detail="Hazard layer missing dataset_url")
     
     try:
-        # Since button only appears after analysis completes, we should always have a cached result
-        # Try to find cached result (check with provided threshold first, then try None)
+        # The export buttons appear once the analysis is done, so the result at this
+        # exact threshold is cached; falling back to the one without a threshold
+        # exported other numbers than the screen showed
         cached_analysis = get_cached_analysis_result(
-            request.file_id, 
-            request.hazard_id, 
+            request.file_id,
+            request.hazard_id,
             request.intensity_threshold
         )
-        
-        # If not found with threshold, try without threshold (for cases where threshold wasn't used)
-        if cached_analysis is None:
-            cached_analysis = get_cached_analysis_result(
-                request.file_id, 
-                request.hazard_id, 
-                None
-            )
-        
+
         if cached_analysis is None:
             raise HTTPException(
                 status_code=404,
@@ -974,7 +967,10 @@ async def export_map(request: ExportMapRequest):
             media_type="image/png",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-        
+
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
