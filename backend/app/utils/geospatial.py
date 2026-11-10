@@ -528,6 +528,12 @@ def sample_points_along_line(
     return points, total_length_m
 
 
+# Fraction of a pixel within which a point counts as on a pixel edge. The float
+# error of the inverse transform is ~1e-10 of a pixel at global scale; 1e-6 of a
+# 1/1200-degree pixel is 0.1 mm.
+_EDGE_TOL = 1e-6
+
+
 def sample_raster_at_points(
     raster_path: str,
     x_coords: np.ndarray,
@@ -549,9 +555,17 @@ def sample_raster_at_points(
     exactly on a pixel boundary then lands on the neighbouring pixel: on the
     Congo cell towers that made 4 of 1594 points disagree with rasterio's own
     sample() by up to 274 mm of flood depth.
+
+    A point on a pixel edge belongs to the pixel the edge starts (east of a
+    column edge, south of a row edge), but the inverse transform puts it a
+    float error to either side, and which side depends on the arithmetic:
+    rasterio's rowcol() sends 69% of the edges of a 1/1200-degree grid that
+    are exact decimals (every multiple of 0.0025) to the neighbouring pixel in
+    1.4 and 41% in 1.5, and the two versions disagreed on 5 of those towers.
+    So the index is floored after adding _EDGE_TOL, which is far above the
+    float error and far below any real distance.
     """
     from concurrent.futures import ThreadPoolExecutor
-    from rasterio.transform import rowcol
     from rasterio.windows import Window
 
     n_points = len(x_coords)
@@ -563,9 +577,11 @@ def sample_raster_at_points(
         transform = src.transform
         height, width = src.height, src.width
 
-    rows, cols = rowcol(transform, x_coords, y_coords)
-    rows = np.asarray(rows, dtype=np.int64)
-    cols = np.asarray(cols, dtype=np.int64)
+    cols_f, rows_f = ~transform * (
+        np.asarray(x_coords, dtype=np.float64), np.asarray(y_coords, dtype=np.float64)
+    )
+    rows = np.floor(rows_f + _EDGE_TOL).astype(np.int64)
+    cols = np.floor(cols_f + _EDGE_TOL).astype(np.int64)
 
     # Off-raster is genuinely unknown, and must not be confused with a zero
     on_raster = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
