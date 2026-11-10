@@ -242,7 +242,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ## Documentation
 
 - [Technical guide](docs/infra-risk-analyzer-technical-guide.pdf): installation, configuration and deployment, for IT teams (Word source alongside)
-- [User guide](frontend/public/infra-risk-analyzer-guide.pdf): how to use the tool, opened by the Guide button in the app
+- [User guide](docs/infra-risk-analyzer-guide.pdf): how to use the tool (Word source alongside); the app's Guide button opens the copy in `frontend/public`
 
 ## License
 
