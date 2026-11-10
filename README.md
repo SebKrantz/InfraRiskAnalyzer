@@ -35,7 +35,7 @@ A high-performance web application for analyzing infrastructure assets against h
 
 ### Prerequisites
 
-- **Backend**: Python 3.9 or higher
+- **Backend**: Python 3.10 or higher
 - **Frontend**: Node.js 18+ and npm
 
 ### Backend Setup
@@ -238,6 +238,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 > **Note**: Use `--workers 1` as the application uses in-memory state for uploaded files and analysis caching. Multi-worker deployment would require Redis or similar for shared state.
+
+## Documentation
+
+- [Technical guide](docs/infra-risk-analyzer-technical-guide.pdf): installation, configuration and deployment, for IT teams (Word source alongside)
+- [User guide](frontend/public/infra-risk-analyzer-guide.pdf): how to use the tool, opened by the Guide button in the app
 
 ## License
 

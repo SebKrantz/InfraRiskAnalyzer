@@ -2,7 +2,7 @@
 .DS_Store
 /App Structure.md
 /cursor_build_steps.md
-/venv
+venv/
 /workflow.md
 
 # API keys (CARTO_API_KEY) live here, never in git
